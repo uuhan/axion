@@ -338,6 +338,12 @@ This project is open-source software.
 
 ---
 
+## 📚 Additional Documentation
+
+- Chinese architecture analysis: `ARCHITECTURE_ZH.md`
+
+---
+
 ## 🤖 AI Usage Disclosure
 
 This project's codebase was initially written by human developers and has since evolved through AI-assisted audits and contributions.
