@@ -60,6 +60,29 @@ pub const Manifest = struct {
     }
 
     pub fn apply(self: *Manifest, tables_to_add: []const TableMetadata, tables_to_delete: []const u64) !void {
+        // Validate first
+        for (tables_to_add) |meta| {
+            if (meta.level >= MAX_LEVELS) return error.InvalidLevel;
+        }
+
+        // Compute new next_file_id
+        var new_next_file_id = self.next_file_id;
+        for (tables_to_add) |meta| {
+            if (meta.id >= new_next_file_id) {
+                new_next_file_id = meta.id + 1;
+            }
+        }
+
+        // Save BEFORE mutating in-memory state.
+        // We temporarily set next_file_id for serialization, then restore on failure.
+        const old_next_file_id = self.next_file_id;
+        self.next_file_id = new_next_file_id;
+        self.saveWithEdits(tables_to_add, tables_to_delete) catch |err| {
+            self.next_file_id = old_next_file_id;
+            return err;
+        };
+
+        // Persistence succeeded — now apply to in-memory state
         // 1. Deletions
         if (tables_to_delete.len > 0) {
             for (tables_to_delete) |del_id| {
@@ -71,7 +94,6 @@ pub const Manifest = struct {
                             self.allocator.free(t.min_key);
                             self.allocator.free(t.max_key);
                             if (t.reader) |r| r.unref();
-                            // Don't increment i
                         } else {
                             i += 1;
                         }
@@ -82,20 +104,13 @@ pub const Manifest = struct {
 
         // 2. Additions
         for (tables_to_add) |meta| {
-            if (meta.level >= MAX_LEVELS) return error.InvalidLevel;
             const min_copy = try self.allocator.dupe(u8, meta.min_key);
             const max_copy = try self.allocator.dupe(u8, meta.max_key);
             var new_meta = meta;
             new_meta.min_key = min_copy;
             new_meta.max_key = max_copy;
             try self.levels[meta.level].append(self.allocator, new_meta);
-
-            if (meta.id >= self.next_file_id) {
-                self.next_file_id = meta.id + 1;
-            }
         }
-
-        try self.save();
     }
 
     pub fn getNextFileId(self: *Manifest) u64 {
@@ -123,76 +138,109 @@ pub const Manifest = struct {
         }
     };
 
-    fn save(self: *Manifest) !void {
-        var buffer: std.ArrayListUnmanaged(u8) = .empty;
-        defer buffer.deinit(self.allocator);
-
-        var writer = ArrayListWriter{ .list = &buffer, .allocator = self.allocator };
-
-        // Simple JSON format
-        // { "next_file_id": 123, "levels": [ [ { "id": 1, ... } ], ... ] }
-
-        try writer.writeAll("{\"next_file_id\": ");
+    fn writeTableJson(writer: ArrayListWriter, table: TableMetadata) !void {
         var buf: [32]u8 = undefined;
-        var s = try std.fmt.bufPrint(&buf, "{}", .{self.next_file_id});
+
+        try writer.writeAll("{\"id\": ");
+        var s = try std.fmt.bufPrint(&buf, "{}", .{table.id});
         try writer.writeAll(s);
 
-        try writer.writeAll(", \"levels\": [");
+        try writer.writeAll(", \"level\": ");
+        s = try std.fmt.bufPrint(&buf, "{}", .{table.level});
+        try writer.writeAll(s);
 
-        for (self.levels, 0..) |level, i| {
-            if (i > 0) try writer.writeAll(",");
-            try writer.writeAll("[");
-            for (level.items, 0..) |table, j| {
-                if (j > 0) try writer.writeAll(",");
-
-                try writer.writeAll("{\"id\": ");
-                s = try std.fmt.bufPrint(&buf, "{}", .{table.id});
-                try writer.writeAll(s);
-
-                try writer.writeAll(", \"level\": ");
-                s = try std.fmt.bufPrint(&buf, "{}", .{table.level});
-                try writer.writeAll(s);
-
-                try writer.writeAll(", \"min_key\": \"");
-                for (table.min_key) |b| {
-                    var hex_buf: [2]u8 = undefined;
-                    _ = try std.fmt.bufPrint(&hex_buf, "{x:0>2}", .{b});
-                    try writer.writeAll(&hex_buf);
-                }
-
-                try writer.writeAll("\", \"max_key\": \"");
-                for (table.max_key) |b| {
-                    var hex_buf: [2]u8 = undefined;
-                    _ = try std.fmt.bufPrint(&hex_buf, "{x:0>2}", .{b});
-                    try writer.writeAll(&hex_buf);
-                }
-
-                try writer.writeAll("\", \"file_size\": ");
-                s = try std.fmt.bufPrint(&buf, "{}", .{table.file_size});
-                try writer.writeAll(s);
-
-                try writer.writeAll(", \"max_version\": ");
-                s = try std.fmt.bufPrint(&buf, "{}", .{table.max_version});
-                try writer.writeAll(s);
-
-                try writer.writeAll("}");
-            }
-            try writer.writeAll("]");
+        try writer.writeAll(", \"min_key\": \"");
+        for (table.min_key) |b| {
+            var hex_buf: [2]u8 = undefined;
+            _ = try std.fmt.bufPrint(&hex_buf, "{x:0>2}", .{b});
+            try writer.writeAll(&hex_buf);
         }
 
-        try writer.writeAll("]}");
+        try writer.writeAll("\", \"max_key\": \"");
+        for (table.max_key) |b| {
+            var hex_buf: [2]u8 = undefined;
+            _ = try std.fmt.bufPrint(&hex_buf, "{x:0>2}", .{b});
+            try writer.writeAll(&hex_buf);
+        }
 
-        // Atomic write: write to .tmp then rename
+        try writer.writeAll("\", \"file_size\": ");
+        s = try std.fmt.bufPrint(&buf, "{}", .{table.file_size});
+        try writer.writeAll(s);
+
+        try writer.writeAll(", \"max_version\": ");
+        s = try std.fmt.bufPrint(&buf, "{}", .{table.max_version});
+        try writer.writeAll(s);
+
+        try writer.writeAll("}");
+    }
+
+    fn persistBuffer(self: *Manifest, buffer_data: []const u8) !void {
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path});
         defer self.allocator.free(tmp_path);
 
         const cwd = std.Io.Dir.cwd();
         const file = try cwd.createFile(self.io, tmp_path, .{});
         defer file.close(self.io);
-        try file.writeStreamingAll(self.io, buffer.items);
+        try file.writeStreamingAll(self.io, buffer_data);
         try file.sync(self.io);
 
         try cwd.rename(tmp_path, cwd, self.path, self.io);
+    }
+
+    fn save(self: *Manifest) !void {
+        try self.saveWithEdits(&.{}, &.{});
+    }
+
+    /// Serialize the projected state (current levels with edits applied) and persist atomically.
+    fn saveWithEdits(self: *Manifest, tables_to_add: []const TableMetadata, tables_to_delete: []const u64) !void {
+        var buffer: std.ArrayListUnmanaged(u8) = .empty;
+        defer buffer.deinit(self.allocator);
+
+        var writer = ArrayListWriter{ .list = &buffer, .allocator = self.allocator };
+        var buf: [32]u8 = undefined;
+
+        try writer.writeAll("{\"next_file_id\": ");
+        const id_str = try std.fmt.bufPrint(&buf, "{}", .{self.next_file_id});
+        try writer.writeAll(id_str);
+
+        try writer.writeAll(", \"levels\": [");
+
+        for (self.levels, 0..) |level, level_idx| {
+            if (level_idx > 0) try writer.writeAll(",");
+            try writer.writeAll("[");
+
+            // Write existing tables (excluding deleted ones)
+            var first = true;
+            for (level.items) |table| {
+                var deleted = false;
+                for (tables_to_delete) |del_id| {
+                    if (table.id == del_id) {
+                        deleted = true;
+                        break;
+                    }
+                }
+                if (deleted) continue;
+
+                if (!first) try writer.writeAll(",");
+                first = false;
+                try writeTableJson(writer, table);
+            }
+
+            // Write added tables for this level
+            for (tables_to_add) |meta| {
+                if (meta.level == level_idx) {
+                    if (!first) try writer.writeAll(",");
+                    first = false;
+                    try writeTableJson(writer, meta);
+                }
+            }
+
+            try writer.writeAll("]");
+        }
+
+        try writer.writeAll("]}");
+
+        try self.persistBuffer(buffer.items);
     }
 
     pub fn load(self: *Manifest) !void {

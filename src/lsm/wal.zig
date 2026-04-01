@@ -72,7 +72,7 @@ pub const WAL = struct {
 
     pub fn deinit(self: *WAL) void {
         if (self.buffer.items.len > 0) {
-            self.performSyncFlush(self.buffer.items);
+            self.performSyncFlush(self.buffer.items) catch {};
         }
         if (builtin.os.tag == .linux and self.use_uring) {
             self.ring.deinit();
@@ -98,15 +98,11 @@ pub const WAL = struct {
         }
     }
 
-    fn performSyncFlush(self: *WAL, data: []const u8) void {
-        self.file.writePositionalAll(self.io, data, self.file_offset) catch |err| {
-            log.err(.wal, "WAL Flush Error: {}", .{err});
-        };
+    fn performSyncFlush(self: *WAL, data: []const u8) !void {
+        try self.file.writePositionalAll(self.io, data, self.file_offset);
 
         if (self.sync_mode == .Full) {
-            self.file.sync(self.io) catch |err| {
-                log.err(.wal, "WAL Sync Error: {}", .{err});
-            };
+            try self.file.sync(self.io);
         }
     }
 
@@ -138,7 +134,7 @@ pub const WAL = struct {
             const link_fsync = (self.sync_mode == .Full);
             const submitted = self.submitWriteAsync(bytes_to_write, link_fsync) catch |err| {
                 log.warn(.wal, "Async WAL Submit Failed: {}. Falling back to Sync.", .{err});
-                self.performSyncFlush(bytes_to_write);
+                try self.performSyncFlush(bytes_to_write);
                 self.file_offset += bytes_to_write.len;
                 self.is_flushing = false;
                 self.current_sync_version = self.flushing_version;
@@ -149,7 +145,7 @@ pub const WAL = struct {
             self.pending_sqe_count = submitted;
             self.file_offset += bytes_to_write.len;
         } else {
-            self.performSyncFlush(bytes_to_write);
+            try self.performSyncFlush(bytes_to_write);
             self.file_offset += bytes_to_write.len;
             self.is_flushing = false;
             self.current_sync_version = self.flushing_version;

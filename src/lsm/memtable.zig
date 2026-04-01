@@ -275,6 +275,7 @@ pub const MemTable = struct {
     io: Io,
     shards: [SHARD_COUNT]*Shard,
     count: std.atomic.Value(usize),
+    total_size: std.atomic.Value(usize),
     ref_count: std.atomic.Value(usize),
 
     pub fn init(allocator: Allocator, io: Io) !*MemTable {
@@ -282,6 +283,7 @@ pub const MemTable = struct {
         self.allocator = allocator;
         self.io = io;
         self.count = std.atomic.Value(usize).init(0);
+        self.total_size = std.atomic.Value(usize).init(0);
         self.ref_count = std.atomic.Value(usize).init(1);
         for (0..SHARD_COUNT) |i| {
             self.shards[i] = try Shard.init(allocator, io);
@@ -318,17 +320,15 @@ pub const MemTable = struct {
     }
 
     pub fn approxSize(self: *MemTable) usize {
-        var size: usize = 0;
-        for (self.shards) |shard| {
-            size += shard.size_bytes;
-        }
-        return size;
+        return self.total_size.load(.monotonic);
     }
 
     pub fn put(self: *MemTable, key: []const u8, value: []const u8, version: u64) !void {
         const shard_idx = getShardIndex(key);
         try self.shards[shard_idx].put(key, value, version);
         _ = self.count.fetchAdd(1, .monotonic);
+        const entry_size = @sizeOf(Shard.Node) + key.len + value.len;
+        _ = self.total_size.fetchAdd(entry_size, .monotonic);
     }
 
     pub fn get(self: *MemTable, key: []const u8, snapshot_version: u64) ?[]const u8 {

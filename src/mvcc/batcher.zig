@@ -267,10 +267,13 @@ pub const CommitBatcher = struct {
 
                 if (req.status == .Success) {
                     // Apply to MemTable
-                    self.tm.applyToMemTable(req.txn, commit_ver) catch {
-                        // MemTable error (OOM?)
+                    self.tm.applyToMemTable(req.txn, commit_ver) catch |err| {
+                        log.err(.wal, "MemTable apply error: {}", .{err});
+                        req.status = .Conflict;
                     };
+                }
 
+                if (req.status == .Success) {
                     // Add to History
                     var w_it = req.txn.buffer.keyIterator();
                     while (w_it.next()) |k| {

@@ -262,12 +262,10 @@ pub const VersionSet = struct {
         // Populate levels from manifest
         for (self.manifest.levels, 0..) |level, i| {
             for (level.items) |table_meta| {
-                var reader: ?*SSTable.Reader = null;
-
-                // Open reader if available
+                // Open reader — fail startup if any persisted SSTable is corrupt/missing
                 const path = try getTablePath(allocator, db_path, table_meta.id);
                 defer allocator.free(path);
-                reader = SSTable.Reader.open(allocator, path, block_cache, self.io) catch null;
+                const reader: ?*SSTable.Reader = try SSTable.Reader.open(allocator, path, block_cache, self.io);
 
                 // Create TableInfo (It takes ownership of keys, so we duplicate)
                 // And it takes ownership of Reader reference (if any)
@@ -353,6 +351,17 @@ pub const VersionSet = struct {
                 const info = try TableInfo.init(self.allocator, meta.id, meta.level, meta.min_key, meta.max_key, meta.file_size, meta.reader);
 
                 try v.levels[meta.level].append(self.allocator, info);
+            }
+
+            // Sort L1+ levels by min_key to maintain binary search invariant
+            for (v.levels[1..]) |*l| {
+                if (l.items.len > 1) {
+                    std.mem.sortUnstable(*TableInfo, l.items, {}, struct {
+                        fn lessThan(_: void, a: *TableInfo, b: *TableInfo) bool {
+                            return Comparator.less(a.min_key, b.min_key);
+                        }
+                    }.lessThan);
+                }
             }
         }
 
