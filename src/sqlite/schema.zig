@@ -34,8 +34,8 @@ pub const TableSchema = struct {
     pub fn init(allocator: Allocator, name: []const u8) !TableSchema {
         return TableSchema{
             .name = try allocator.dupe(u8, name),
-            .columns = .{},
-            .indexes = .{},
+            .columns = .empty,
+            .indexes = .empty,
             .next_column_id = 1,
             .next_index_id = 1,
             .allocator = allocator,
@@ -67,7 +67,7 @@ pub const TableSchema = struct {
     }
 
     pub fn addIndex(self: *TableSchema, name: []const u8, col_names: []const []const u8, unique: bool) !void {
-        var ids = std.ArrayListUnmanaged(u32){};
+        var ids = std.ArrayListUnmanaged(u32).empty;
         errdefer ids.deinit(self.allocator);
 
         for (col_names) |c_name| {
@@ -93,7 +93,7 @@ pub const TableSchema = struct {
     }
 
     pub fn toJson(self: *TableSchema) ![]u8 {
-        var list = std.ArrayListUnmanaged(u8){};
+        var list = std.ArrayListUnmanaged(u8).empty;
         defer list.deinit(self.allocator);
 
         const header = try std.fmt.allocPrint(self.allocator, "{{\"name\": \"{s}\", \"next_column_id\": {}, \"next_index_id\": {}, \"columns\": [", .{ self.name, self.next_column_id, self.next_index_id });
@@ -174,7 +174,7 @@ pub const TableSchema = struct {
                     const id = obj.get("id").?.integer;
                     const unique = if (obj.get("unique")) |v| v.bool else false;
 
-                    var ids = std.ArrayListUnmanaged(u32){};
+                    var ids = std.ArrayListUnmanaged(u32).empty;
 
                     if (obj.get("column_ids")) |cids_val| {
                         if (cids_val == .array) {

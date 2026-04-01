@@ -11,7 +11,8 @@ const lz4 = @cImport({
 });
 
 pub const Reader = struct {
-    file: std.fs.File,
+    file: std.Io.File,
+    io: std.Io,
     allocator: Allocator,
     file_size: u64,
     index: std.ArrayListUnmanaged(Format.IndexEntry),
@@ -33,9 +34,9 @@ pub const Reader = struct {
         }
     };
 
-    pub fn open(allocator: Allocator, path: []const u8, block_cache: ?*BlockCache) !*Reader {
-        const file = try std.fs.cwd().openFile(path, .{});
-        const stat = try file.stat();
+    pub fn open(allocator: Allocator, path: []const u8, block_cache: ?*BlockCache, io: std.Io) !*Reader {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        const stat = try file.stat(io);
         const file_size = stat.size;
 
         if (file_size < Format.FOOTER_SIZE) return error.InvalidSSTable;
@@ -47,7 +48,7 @@ pub const Reader = struct {
             mmap_ptr = std.posix.mmap(
                 null,
                 file_size,
-                1,
+                .{ .READ = true },
                 .{ .TYPE = .PRIVATE },
                 file.handle,
                 0,
@@ -57,9 +58,10 @@ pub const Reader = struct {
         const self = try allocator.create(Reader);
         self.* = Reader{
             .file = file,
+            .io = io,
             .allocator = allocator,
             .file_size = file_size,
-            .index = .{},
+            .index = .empty,
             .bloom = undefined,
             .block_cache = block_cache,
             .file_id = file_id,
@@ -87,7 +89,7 @@ pub const Reader = struct {
         if (self.mmap_ptr) |ptr| {
             std.posix.munmap(ptr);
         }
-        self.file.close();
+        self.file.close(self.io);
         for (self.index.items) |entry| {
             self.allocator.free(entry.key);
         }
@@ -97,7 +99,8 @@ pub const Reader = struct {
     }
 
     const FileReader = struct {
-        file: std.fs.File,
+        file: std.Io.File,
+        io: std.Io,
         mmap_ptr: ?[]const u8,
         pos: u64 = 0,
 
@@ -107,12 +110,9 @@ pub const Reader = struct {
                 @memcpy(buf, mem[self.pos..][0..buf.len]);
                 self.pos += buf.len;
             } else {
-                var index: usize = 0;
-                while (index < buf.len) {
-                    const n = try self.file.read(buf[index..]);
-                    if (n == 0) return error.EndOfStream;
-                    index += n;
-                }
+                const n = try self.file.readPositionalAll(self.io, buf, self.pos);
+                if (n < buf.len) return error.EndOfStream;
+                self.pos += n;
             }
         }
 
@@ -124,13 +124,9 @@ pub const Reader = struct {
     };
 
     fn readFooter(self: *Reader) !void {
-        var reader = FileReader{ .file = self.file, .mmap_ptr = self.mmap_ptr };
+        var reader = FileReader{ .file = self.file, .io = self.io, .mmap_ptr = self.mmap_ptr };
 
-        if (self.mmap_ptr) |_| {
-            reader.pos = self.file_size - Format.FOOTER_SIZE;
-        } else {
-            try self.file.seekTo(self.file_size - Format.FOOTER_SIZE);
-        }
+        reader.pos = self.file_size - Format.FOOTER_SIZE;
 
         const index_offset = try reader.readInt(u64, .little);
         const filter_offset = try reader.readInt(u64, .little);
@@ -140,11 +136,7 @@ pub const Reader = struct {
         if (magic != Format.MAGIC) return error.InvalidMagic;
         if (version != Format.VERSION) return error.UnsupportedVersion;
 
-        if (self.mmap_ptr) |_| {
-            reader.pos = index_offset;
-        } else {
-            try self.file.seekTo(index_offset);
-        }
+        reader.pos = index_offset;
 
         const num_entries = try reader.readInt(u32, .little);
         try self.index.ensureTotalCapacity(self.allocator, num_entries);
@@ -163,11 +155,7 @@ pub const Reader = struct {
             });
         }
 
-        if (self.mmap_ptr) |_| {
-            reader.pos = filter_offset;
-        } else {
-            try self.file.seekTo(filter_offset);
-        }
+        reader.pos = filter_offset;
         self.bloom = try BloomFilter.read(self.allocator, &reader);
     }
 
@@ -228,7 +216,7 @@ pub const Reader = struct {
         } else blk: {
             if (entry.length < 9) return error.CorruptBlock;
             const buf = try self.allocator.alloc(u8, entry.length);
-            const n = try self.file.preadAll(buf, entry.offset);
+            const n = try self.file.readPositionalAll(self.io, buf, entry.offset);
             if (n != buf.len) {
                 self.allocator.free(buf);
                 return error.EndOfStream;

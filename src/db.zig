@@ -36,6 +36,7 @@ pub const DB = struct {
     };
 
     allocator: std.mem.Allocator,
+    io: std.Io,
     options: DBOptions,
 
     versions: *VersionSet, // Manages Version, Manifest, MemTables
@@ -46,46 +47,47 @@ pub const DB = struct {
 
     // Background Flush
     flush_thread: std.Thread,
-    flush_mutex: std.Thread.Mutex,
-    flush_cond: std.Thread.Condition,
+    flush_mutex: std.Io.Mutex,
+    flush_cond: std.Io.Condition,
 
     // Background Compaction
     compaction_threads: []std.Thread,
-    compaction_mutex: std.Thread.Mutex,
-    compaction_cond: std.Thread.Condition,
+    compaction_mutex: std.Io.Mutex,
+    compaction_cond: std.Io.Condition,
 
     running: std.atomic.Value(bool),
     bg_error: std.atomic.Value(usize),
 
     // Flow Control
-    flow_mutex: std.Thread.Mutex,
-    flow_cond: std.Thread.Condition,
+    flow_mutex: std.Io.Mutex,
+    flow_cond: std.Io.Condition,
 
     const MAX_PENDING_MEMTABLES = 8;
 
-    pub fn open(allocator: std.mem.Allocator, dir_path: []const u8, options: DBOptions) !*DB {
+    pub fn open(allocator: std.mem.Allocator, dir_path: []const u8, options: DBOptions, io: std.Io) !*DB {
         const self = try allocator.create(DB);
         self.allocator = allocator;
+        self.io = io;
         self.options = options;
         self.db_path = try allocator.dupe(u8, dir_path);
 
         // Initialize Block Cache
-        const block_cache = BlockCache.init(allocator, options.block_cache_size_bytes);
+        const block_cache = BlockCache.init(allocator, io, options.block_cache_size_bytes);
         const bc_ptr = try allocator.create(BlockCache);
         bc_ptr.* = block_cache;
 
         // Ensure directory exists
-        std.fs.cwd().makePath(dir_path) catch |err| {
+        std.Io.Dir.cwd().createDirPath(io, dir_path) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
         // Initialize MemTable
-        const memtable = try MemTable.init(allocator);
+        const memtable = try MemTable.init(allocator, io);
         errdefer memtable.unref();
 
         // Initialize VersionSet
         // VersionSet.init calls Version.init, which REFs the memtable. ref=2.
-        self.versions = try VersionSet.init(allocator, dir_path, bc_ptr, memtable);
+        self.versions = try VersionSet.init(allocator, io, dir_path, bc_ptr, memtable);
 
         // We don't need our reference anymore.
         memtable.unref(); // ref=1 (held by Version)
@@ -93,20 +95,20 @@ pub const DB = struct {
         const wal_path = try std.fs.path.join(allocator, &.{ dir_path, "WAL" });
         defer allocator.free(wal_path);
 
-        self.wal = try WAL.init(allocator, wal_path, options.wal_sync_mode);
+        self.wal = try WAL.init(allocator, wal_path, options.wal_sync_mode, io);
 
         // Replay WAL
         var max_version: u64 = 0;
         {
             // Find max persisted version in Manifest
             var max_persisted: u64 = 0;
-            self.versions.mutex.lock();
+            self.versions.mutex.lockUncancelable(self.io);
             for (self.versions.manifest.levels) |level| {
                 for (level.items) |meta| {
                     if (meta.max_version > max_persisted) max_persisted = meta.max_version;
                 }
             }
-            self.versions.mutex.unlock();
+            self.versions.mutex.unlock(self.io);
 
             const v = self.versions.getCurrent();
             defer v.unref();
@@ -118,21 +120,21 @@ pub const DB = struct {
             const v = self.versions.getCurrent();
             defer v.unref();
 
-            self.tm = try TransactionManager.create(allocator, v.memtable, &self.wal, self, storageGet, storageIterator, storageGetLatestVersion, max_version);
+            self.tm = try TransactionManager.create(allocator, v.memtable, &self.wal, self, storageGet, storageIterator, storageGetLatestVersion, max_version, self.io);
         }
 
         // Start Background Threads
         self.running = std.atomic.Value(bool).init(true);
         self.bg_error = std.atomic.Value(usize).init(0);
 
-        self.flush_mutex = std.Thread.Mutex{};
-        self.flush_cond = std.Thread.Condition{};
+        self.flush_mutex = .init;
+        self.flush_cond = .init;
 
-        self.compaction_mutex = std.Thread.Mutex{};
-        self.compaction_cond = std.Thread.Condition{};
+        self.compaction_mutex = .init;
+        self.compaction_cond = .init;
 
-        self.flow_mutex = std.Thread.Mutex{};
-        self.flow_cond = std.Thread.Condition{};
+        self.flow_mutex = .init;
+        self.flow_cond = .init;
 
         self.flush_thread = try std.Thread.spawn(.{}, flushLoop, .{self});
 
@@ -149,13 +151,13 @@ pub const DB = struct {
         // Stop bg threads
         self.running.store(false, .release);
 
-        self.flush_mutex.lock();
-        self.flush_cond.signal();
-        self.flush_mutex.unlock();
+        self.flush_mutex.lockUncancelable(self.io);
+        self.flush_cond.signal(self.io);
+        self.flush_mutex.unlock(self.io);
 
-        self.compaction_mutex.lock();
-        self.compaction_cond.broadcast();
-        self.compaction_mutex.unlock();
+        self.compaction_mutex.lockUncancelable(self.io);
+        self.compaction_cond.broadcast(self.io);
+        self.compaction_mutex.unlock(self.io);
 
         self.flush_thread.join();
         for (self.compaction_threads) |t| {
@@ -214,8 +216,8 @@ pub const DB = struct {
 
     pub fn checkMemTableCapacity(self: *DB) !void {
         // Check flow control
-        self.flow_mutex.lock();
-        defer self.flow_mutex.unlock();
+        self.flow_mutex.lockUncancelable(self.io);
+        defer self.flow_mutex.unlock(self.io);
 
         while (true) {
             const v = self.versions.getCurrent();
@@ -224,7 +226,7 @@ pub const DB = struct {
 
             if (pending < MAX_PENDING_MEMTABLES) break;
 
-            self.flow_cond.wait(&self.flow_mutex);
+            self.flow_cond.waitUncancelable(self.io, &self.flow_mutex);
             try self.checkBgError();
         }
 
@@ -321,7 +323,7 @@ pub const DB = struct {
 
     fn rotateMemTable(self: *DB) !void {
         // Optimization: Init new memtable without lock
-        const new_mem = try MemTable.init(self.allocator);
+        const new_mem = try MemTable.init(self.allocator, self.io);
         errdefer new_mem.unref();
 
         // Lock commit to prevent writes during swap
@@ -351,15 +353,15 @@ pub const DB = struct {
         self.tm.memtable = new_mem;
 
         // Signal Flush Thread
-        self.flush_mutex.lock();
-        self.flush_cond.signal();
-        self.flush_mutex.unlock();
+        self.flush_mutex.lockUncancelable(self.io);
+        self.flush_cond.signal(self.io);
+        self.flush_mutex.unlock(self.io);
     }
 
     fn flushLoop(self: *DB) void {
         while (self.running.load(.monotonic)) {
             // Wait for work
-            self.flush_mutex.lock();
+            self.flush_mutex.lockUncancelable(self.io);
             var has_work = false;
             {
                 const v = self.versions.getCurrent();
@@ -368,9 +370,9 @@ pub const DB = struct {
             }
 
             if (!has_work and self.running.load(.monotonic)) {
-                self.flush_cond.wait(&self.flush_mutex);
+                self.flush_cond.waitUncancelable(self.io, &self.flush_mutex);
             }
-            self.flush_mutex.unlock();
+            self.flush_mutex.unlock(self.io);
 
             if (!self.running.load(.monotonic)) break;
 
@@ -397,14 +399,14 @@ pub const DB = struct {
                 mem.unref();
 
                 // Signal writers that space is available
-                self.flow_mutex.lock();
-                self.flow_cond.broadcast();
-                self.flow_mutex.unlock();
+                self.flow_mutex.lockUncancelable(self.io);
+                self.flow_cond.broadcast(self.io);
+                self.flow_mutex.unlock(self.io);
 
                 // Signal Compaction that new file exists
-                self.compaction_mutex.lock();
-                self.compaction_cond.signal();
-                self.compaction_mutex.unlock();
+                self.compaction_mutex.lockUncancelable(self.io);
+                self.compaction_cond.signal(self.io);
+                self.compaction_mutex.unlock(self.io);
             }
         }
     }
@@ -414,11 +416,11 @@ pub const DB = struct {
 
         while (self.running.load(.monotonic)) {
             // Wait for signal or timeout (to check periodically)
-            self.compaction_mutex.lock();
+            self.compaction_mutex.lockUncancelable(self.io);
             if (self.running.load(.monotonic)) {
-                self.compaction_cond.timedWait(&self.compaction_mutex, 100 * std.time.ns_per_ms) catch {};
+                self.compaction_cond.waitUncancelable(self.io, &self.compaction_mutex);
             }
-            self.compaction_mutex.unlock();
+            self.compaction_mutex.unlock(self.io);
 
             if (!self.running.load(.monotonic)) break;
 
@@ -430,8 +432,8 @@ pub const DB = struct {
                 {
                     // We MUST lock versions to ensure stable level view while picking
                     // and to atomic check-and-set is_compacting flags.
-                    self.versions.mutex.lock();
-                    defer self.versions.mutex.unlock();
+                    self.versions.mutex.lockUncancelable(self.io);
+                    defer self.versions.mutex.unlock(self.io);
 
                     const v = self.versions.current;
                     v.ref();
@@ -474,14 +476,14 @@ pub const DB = struct {
             return;
         }
 
-        self.versions.mutex.lock();
+        self.versions.mutex.lockUncancelable(self.io);
         const file_id = self.versions.manifest.getNextFileId();
-        self.versions.mutex.unlock();
+        self.versions.mutex.unlock(self.io);
 
         const path = try self.getTablePath(file_id);
         defer self.allocator.free(path);
 
-        var builder = try SSTable.Builder.init(self.allocator, path, true, mem.count.load(.acquire), self.options.block_size);
+        var builder = try SSTable.Builder.init(self.allocator, path, true, mem.count.load(.acquire), self.options.block_size, self.io);
         defer builder.deinit();
 
         var iter = try mem.iterator();
@@ -506,7 +508,7 @@ pub const DB = struct {
             const min_dup = try self.allocator.dupe(u8, min);
             const max_dup = try self.allocator.dupe(u8, max_key.?);
 
-            const reader = try SSTable.Reader.open(self.allocator, path, self.versions.block_cache);
+            const reader = try SSTable.Reader.open(self.allocator, path, self.versions.block_cache, self.io);
 
             var edit = VersionEdit.init(self.allocator);
             defer edit.deinit();
@@ -535,8 +537,8 @@ pub const DB = struct {
 
     fn dbIdGen(ctx: *anyopaque) u64 {
         const self: *DB = @ptrCast(@alignCast(ctx));
-        self.versions.mutex.lock();
-        defer self.versions.mutex.unlock();
+        self.versions.mutex.lockUncancelable(self.io);
+        defer self.versions.mutex.unlock(self.io);
         return self.versions.manifest.getNextFileId();
     }
 
@@ -547,8 +549,8 @@ pub const DB = struct {
             for (task.next_level_tables.items) |tbl| tbl.is_compacting.store(false, .release);
         }
 
-        var inputs = std.ArrayListUnmanaged([]const u8){};
-        var old_ids = std.ArrayListUnmanaged(u64){};
+        var inputs: std.ArrayListUnmanaged([]const u8) = .empty;
+        var old_ids: std.ArrayListUnmanaged(u64) = .empty;
 
         defer {
             for (inputs.items) |p| self.allocator.free(p);
@@ -570,7 +572,7 @@ pub const DB = struct {
 
         const target_size = 64 * 1024 * 1024;
 
-        var results = try Compaction.compact(self.allocator, inputs.items, self.db_path, self.tm.getMinActiveVersion(), target_size, self, dbIdGen);
+        var results = try Compaction.compact(self.allocator, inputs.items, self.db_path, self.tm.getMinActiveVersion(), target_size, self, dbIdGen, self.io);
 
         defer {
             for (results.items) |*r| {
@@ -590,7 +592,7 @@ pub const DB = struct {
                 const path = try self.getTablePath(res.id);
                 defer self.allocator.free(path);
 
-                const reader = try SSTable.Reader.open(self.allocator, path, self.versions.block_cache);
+                const reader = try SSTable.Reader.open(self.allocator, path, self.versions.block_cache, self.io);
 
                 try edit.tables_to_add.append(self.allocator, .{
                     .id = res.id,
@@ -606,7 +608,7 @@ pub const DB = struct {
             edit.release();
 
             for (inputs.items) |p| {
-                std.fs.cwd().deleteFile(p) catch |err| {
+                std.Io.Dir.cwd().deleteFile(self.io, p) catch |err| {
                     if (err != error.FileNotFound) {
                         log.warn(.compaction, "Failed to delete compacted file {s}: {}", .{ p, err });
                     }
@@ -653,7 +655,7 @@ pub const DB = struct {
         try self.flushSync();
 
         // 1. Create backup directory
-        std.fs.cwd().makePath(backup_path) catch |err| {
+        std.Io.Dir.cwd().createDirPath(self.io, backup_path) catch |err| {
             if (err != error.PathAlreadyExists) return err;
             // Else, path already exists, continue (allow backing up to existing dir)
         };
@@ -668,7 +670,7 @@ pub const DB = struct {
         const manifest_dst_path = try std.fs.path.join(self.allocator, &.{ backup_path, "MANIFEST" });
         defer self.allocator.free(manifest_dst_path);
 
-        std.fs.cwd().copyFile(manifest_src_path, std.fs.cwd(), manifest_dst_path, .{}) catch |err| {
+        std.Io.Dir.cwd().copyFile(manifest_src_path, .cwd(), manifest_dst_path, self.io, .{}) catch |err| {
             if (err != error.FileNotFound) return err; // If no manifest, then it's a fresh DB
         };
 
@@ -678,7 +680,7 @@ pub const DB = struct {
         const wal_dst_path = try std.fs.path.join(self.allocator, &.{ backup_path, "WAL" });
         defer self.allocator.free(wal_dst_path);
 
-        std.fs.cwd().copyFile(wal_src_path, std.fs.cwd(), wal_dst_path, .{}) catch |err| {
+        std.Io.Dir.cwd().copyFile(wal_src_path, .cwd(), wal_dst_path, self.io, .{}) catch |err| {
             if (err != error.FileNotFound) return err; // If no wal, then it's a fresh DB
         };
 
@@ -693,7 +695,7 @@ pub const DB = struct {
                 const sst_dst_path = try std.fs.path.join(self.allocator, &.{ backup_path, sst_dst_filename });
                 defer self.allocator.free(sst_dst_path);
 
-                std.fs.cwd().copyFile(sst_src_path, std.fs.cwd(), sst_dst_path, .{}) catch |err| {
+                std.Io.Dir.cwd().copyFile(sst_src_path, .cwd(), sst_dst_path, self.io, .{}) catch |err| {
                     if (err != error.FileNotFound) return err; // Should not happen if manifest is correct
                 };
             }
@@ -703,15 +705,15 @@ pub const DB = struct {
 
 test "DB integration" {
     const allocator = std.testing.allocator;
-    var buf: [64]u8 = undefined;
-    const test_path = try std.fmt.bufPrint(&buf, "test_db_dir_{}", .{std.crypto.random.int(u64)});
+    const io = std.testing.io;
+    const test_path = "test_db_dir_integration";
 
-    std.fs.cwd().deleteTree(test_path) catch {};
-    defer std.fs.cwd().deleteTree(test_path) catch {};
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
 
     // std.debug.print("Opening DB...\n", .{});
     {
-        var db = try DB.open(allocator, test_path, .{});
+        var db = try DB.open(allocator, test_path, .{}, io);
         defer db.close();
         // std.debug.print("DB Opened.\n", .{});
 
@@ -729,7 +731,7 @@ test "DB integration" {
 
     // Re-open to test durability
     {
-        var db2 = try DB.open(allocator, test_path, .{});
+        var db2 = try DB.open(allocator, test_path, .{}, io);
         defer db2.close();
 
         if (try db2.get("user:1")) |val| {

@@ -75,7 +75,8 @@ fn runBenchmark(allocator: std.mem.Allocator, workload: Workload) !void {
 
     // Clean previous
     if (workload == .Insert) {
-        std.fs.cwd().deleteTree(DB_PATH) catch {};
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.cwd().deleteTree(io, DB_PATH) catch {};
     }
 
     // If Read, we need to pre-populate
@@ -105,7 +106,7 @@ fn runBenchmark(allocator: std.mem.Allocator, workload: Workload) !void {
     ops_count.store(0, .monotonic);
     should_stop.store(false, .monotonic);
 
-    var threads = std.ArrayListUnmanaged(std.Thread){};
+    var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
     defer threads.deinit(allocator);
 
     var i: usize = 0;
@@ -137,7 +138,8 @@ fn runBenchmark(allocator: std.mem.Allocator, workload: Workload) !void {
     // So we can delete tree.
 
     if (workload == .Read) {
-        std.fs.cwd().deleteTree(DB_PATH) catch {};
+        const vtab_io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.cwd().deleteTree(vtab_io, DB_PATH) catch {};
     }
 }
 

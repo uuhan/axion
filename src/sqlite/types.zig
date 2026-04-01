@@ -23,7 +23,7 @@ pub const TxnEntry = struct {
 
 pub const REGISTRY_SHARDS = 64;
 pub const RegistryShard = struct {
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     map: std.AutoHashMap(RegistryKey, TxnEntry),
 };
 
@@ -34,7 +34,7 @@ pub const ShardedRegistry = struct {
     pub fn init(alloc: std.mem.Allocator) !ShardedRegistry {
         const s = try alloc.alloc(RegistryShard, REGISTRY_SHARDS);
         for (s) |*shard| {
-            shard.mutex = .{};
+            shard.mutex = .init;
             shard.map = std.AutoHashMap(RegistryKey, TxnEntry).init(alloc);
         }
         return .{ .shards = s, .allocator = alloc };
@@ -48,7 +48,13 @@ pub const ShardedRegistry = struct {
 
 // Global Registry Instance
 pub var registry: ShardedRegistry = undefined;
-pub var registry_init_once = std.once(initRegistry);
+pub var registry_initialized = std.atomic.Value(bool).init(false);
+
+pub fn ensureRegistryInit() void {
+    if (registry_initialized.cmpxchgStrong(false, true, .seq_cst, .monotonic) == null) {
+        registry = ShardedRegistry.init(allocator) catch @panic("OOM");
+    }
+}
 
 fn initRegistry() void {
     registry = ShardedRegistry.init(allocator) catch @panic("OOM");
@@ -60,10 +66,10 @@ pub const SharedDB = struct {
     ref_count: usize,
 };
 
-pub var db_registry_mutex = std.Thread.Mutex{};
+pub var db_registry_mutex: std.Io.Mutex = .init;
 pub var db_registry: ?std.StringHashMap(*SharedDB) = null;
 
-pub var vtab_registry_mutex = std.Thread.Mutex{};
+pub var vtab_registry_mutex: std.Io.Mutex = .init;
 pub var vtab_registry: ?std.StringHashMap(*AxionVTab) = null;
 
 pub fn getVTabRegistryKey(alloc: std.mem.Allocator, conn: *c.sqlite3, name: []const u8) ![]u8 {

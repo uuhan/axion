@@ -54,7 +54,8 @@ export fn axion_db_open_with_options(path: [*c]const u8, opts: *axion_options_t,
 
 fn axion_db_open_internal(path: [*c]const u8, options: DB.DBOptions, out_db: *?*axion_db_t) c_int {
     const path_slice = std.mem.span(path);
-    const db = DB.open(allocator, path_slice, options) catch return -1;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const db = DB.open(allocator, path_slice, options, io) catch return -1;
     out_db.* = @ptrCast(db);
     return 0;
 }

@@ -30,7 +30,8 @@ pub const CommitBatcher = struct {
 
     thread: std.Thread,
     running: std.atomic.Value(bool),
-    execution_mutex: std.Thread.Mutex,
+    io: std.Io,
+    execution_mutex: std.Io.Mutex,
 
     // For waking up the batcher thread
     event_futex: std.atomic.Value(u32),
@@ -40,13 +41,14 @@ pub const CommitBatcher = struct {
     history_idx: usize,
     history_min_ver: u64,
 
-    pub fn init(allocator: std.mem.Allocator, tm: *TransactionManager) !*CommitBatcher {
+    pub fn init(allocator: std.mem.Allocator, tm: *TransactionManager, io: std.Io) !*CommitBatcher {
         const self = try allocator.create(CommitBatcher);
         self.allocator = allocator;
         self.tm = tm;
         self.head = std.atomic.Value(?*CommitRequest).init(null);
         self.running = std.atomic.Value(bool).init(true);
-        self.execution_mutex = std.Thread.Mutex{};
+        self.io = io;
+        self.execution_mutex = .init;
         self.event_futex = std.atomic.Value(u32).init(0);
 
         self.history = try allocator.alloc(HistoryEntry, HISTORY_SIZE);
@@ -60,18 +62,18 @@ pub const CommitBatcher = struct {
 
     pub fn deinit(self: *CommitBatcher) void {
         self.running.store(false, .release);
-        std.Thread.Futex.wake(&self.event_futex, 1);
+        self.io.futexWake(u32, &self.event_futex.raw, 1);
         self.thread.join();
         self.allocator.free(self.history);
         self.allocator.destroy(self);
     }
 
     pub fn lockExecution(self: *CommitBatcher) void {
-        self.execution_mutex.lock();
+        self.execution_mutex.lockUncancelable(self.io);
     }
 
     pub fn unlockExecution(self: *CommitBatcher) void {
-        self.execution_mutex.unlock();
+        self.execution_mutex.unlock(self.io);
     }
 
     pub fn submit(self: *CommitBatcher, req: *CommitRequest) void {
@@ -93,7 +95,7 @@ pub const CommitBatcher = struct {
 
         // Wake up batcher
         self.event_futex.store(1, .release);
-        std.Thread.Futex.wake(&self.event_futex, 1);
+        self.io.futexWake(u32, &self.event_futex.raw, 1);
     }
 
     fn run(self: *CommitBatcher) void {
@@ -149,7 +151,7 @@ pub const CommitBatcher = struct {
                     if (signal == 1) {
                         continue;
                     }
-                    std.Thread.Futex.wait(&self.event_futex, 0);
+                    self.io.futexWaitUncancelable(u32, &self.event_futex.raw, 0);
                 }
                 continue;
             }
@@ -177,9 +179,9 @@ pub const CommitBatcher = struct {
             if (queue_head == null) queue_tail = null;
 
             // 3. Process Batch (CPU Work)
-            self.execution_mutex.lock();
+            self.execution_mutex.lockUncancelable(self.io);
             const result = self.prepareBatch(current_batch);
-            self.execution_mutex.unlock();
+            self.execution_mutex.unlock(self.io);
 
             // 4. Complete Previous Flush (Wait IO)
             if (pending_flush_ver) |_| {
@@ -294,12 +296,11 @@ pub const CommitBatcher = struct {
     }
 
     fn wakeClients(self: *CommitBatcher, list: ?*CommitRequest) void {
-        _ = self;
         var notify = list;
         while (notify) |req| {
             const next = req.next;
             req.done.store(1, .release);
-            std.Thread.Futex.wake(&req.done, 1);
+            self.io.futexWake(u32, &req.done.raw, 1);
             notify = next;
         }
     }

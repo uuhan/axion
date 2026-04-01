@@ -45,7 +45,7 @@ pub fn parseSqliteSchema(alloc: std.mem.Allocator, sql: []const u8, table_name: 
 
             const inner = token[open_paren + 1 .. close_paren];
 
-            var col_names = std.ArrayListUnmanaged([]const u8){};
+            var col_names = std.ArrayListUnmanaged([]const u8).empty;
             defer col_names.deinit(alloc);
 
             var split = std.mem.tokenizeAny(u8, inner, ",");
@@ -53,7 +53,7 @@ pub fn parseSqliteSchema(alloc: std.mem.Allocator, sql: []const u8, table_name: 
                 try col_names.append(alloc, std.mem.trim(u8, part, " \n\r\t"));
             }
 
-            var name_buf = std.ArrayListUnmanaged(u8){};
+            var name_buf = std.ArrayListUnmanaged(u8).empty;
             defer name_buf.deinit(alloc);
             try name_buf.appendSlice(alloc, if (is_unique) "uidx_" else "idx_");
             try name_buf.appendSlice(alloc, schema.name);
@@ -95,7 +95,7 @@ pub fn parseSqliteSchema(alloc: std.mem.Allocator, sql: []const u8, table_name: 
 
         if (is_unique_col and !is_pk) {
             // Create implicit unique index for this column
-            var name_buf = std.ArrayListUnmanaged(u8){};
+            var name_buf = std.ArrayListUnmanaged(u8).empty;
             defer name_buf.deinit(alloc);
             try name_buf.appendSlice(alloc, "uidx_");
             try name_buf.appendSlice(alloc, schema.name);

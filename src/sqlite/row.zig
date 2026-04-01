@@ -12,13 +12,13 @@ pub const Row = struct {
     };
 
     pub fn serialize(allocator: Allocator, values: []const Value) ![]u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         defer buf.deinit(allocator);
 
-        var header = std.ArrayListUnmanaged(u8){};
+        var header = std.ArrayListUnmanaged(u8).empty;
         defer header.deinit(allocator);
 
-        var body = std.ArrayListUnmanaged(u8){};
+        var body = std.ArrayListUnmanaged(u8).empty;
         defer body.deinit(allocator);
 
         for (values) |val| {
@@ -55,7 +55,7 @@ pub const Row = struct {
         // But we don't know how many columns.
         // We can write num_columns.
 
-        var final_buf = std.ArrayListUnmanaged(u8){};
+        var final_buf = std.ArrayListUnmanaged(u8).empty;
         defer final_buf.deinit(allocator);
 
         try writeVarint(allocator, &final_buf, values.len);

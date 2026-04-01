@@ -121,11 +121,12 @@ fn worker(db_path: [:0]const u8, workload: Workload, mode: Mode, seed: u64) void
 fn runBenchmark(allocator: std.mem.Allocator, mode: Mode, workload: Workload) !void {
     const db_path = "bench.db";
     const db_path_c = "bench.db";
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     // Clean previous
-    std.fs.cwd().deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile("bench.db-wal") catch {};
-    std.fs.cwd().deleteFile("bench.db-shm") catch {};
+    std.Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, "bench.db-wal") catch {};
+    std.Io.Dir.cwd().deleteFile(io, "bench.db-shm") catch {};
 
     // Setup DB
     var db: ?*c.sqlite3 = null;
@@ -174,7 +175,7 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: Mode, workload: Workload) !v
     should_stop.store(false, .monotonic);
 
     // Spawn Threads
-    var threads = std.ArrayListUnmanaged(std.Thread){};
+    var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
     defer threads.deinit(allocator);
 
     var i: usize = 0;
@@ -206,14 +207,15 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: Mode, workload: Workload) !v
     }, qps, total_ops });
 
     // Cleanup DB file
-    std.fs.cwd().deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile("bench.db-wal") catch {};
-    std.fs.cwd().deleteFile("bench.db-shm") catch {};
+    std.Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, "bench.db-wal") catch {};
+    std.Io.Dir.cwd().deleteFile(io, "bench.db-shm") catch {};
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    var da: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = da.deinit();
+    const allocator = da.allocator();
 
     std.debug.print("Running SQLite Benchmarks (100 threads, 5s each).\n", .{});
     std.debug.print("---------------------------------------------------\n", .{});

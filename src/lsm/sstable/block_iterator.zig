@@ -64,8 +64,8 @@ pub const BlockIterator = struct {
             .block_data = block_data,
             .fbs = FixedBufferStream.init(block_data),
             .restarts_limit = limit,
-            .key_buf_a = .{},
-            .key_buf_b = .{},
+            .key_buf_a = .empty,
+            .key_buf_b = .empty,
             .use_buf_a = true,
         };
     }

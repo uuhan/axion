@@ -36,10 +36,9 @@ pub const BenchmarkConfig = struct {
     filter_workload: ?Workload = null,
     filter_mode: ?Mode = null,
 
-    pub fn parseArgs(allocator: std.mem.Allocator) !BenchmarkConfig {
+    pub fn parseArgs(process_args: std.process.Args) !BenchmarkConfig {
         var config = BenchmarkConfig{};
-        var args = try std.process.argsWithAllocator(allocator);
-        defer args.deinit();
+        var args = std.process.Args.Iterator.init(process_args);
 
         _ = args.skip(); // Skip executable name
 

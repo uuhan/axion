@@ -5,9 +5,10 @@ const AxionVTab = @import("axion").sqlite.vtab;
 
 // A simple test to verify schema support integration in VTab
 test "SQLite VTab Schema Integration" {
+    const io = std.testing.io;
     const db_path = "test_vtab_schema_db";
-    std.fs.cwd().deleteTree(db_path) catch {};
-    defer std.fs.cwd().deleteTree(db_path) catch {};
+    std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
 
     // Open In-Memory SQLite
     var db: ?*c.sqlite3 = null;

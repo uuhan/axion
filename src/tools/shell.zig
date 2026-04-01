@@ -3,12 +3,21 @@ const c = @import("axion").sqlite.c;
 const vtab = @import("axion").sqlite.vtab;
 const metrics = @import("axion").metrics;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args_iter.skip(); // Skip executable name
+
+    // Collect args into a slice for indexed access
+    var args_list: std.ArrayListUnmanaged([:0]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    // Add a placeholder for the executable name
+    try args_list.append(allocator, "axion_shell");
+    while (args_iter.next()) |arg| {
+        try args_list.append(allocator, arg);
+    }
+    const args = args_list.items;
 
     var db_path: ?[]const u8 = null;
     var config_file: ?[]const u8 = null;
@@ -74,7 +83,7 @@ pub fn main() !void {
 
     // Auto-mount DB if path provided
     if (db_path) |path| {
-        var opts_buf = std.ArrayListUnmanaged(u8){};
+        var opts_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer opts_buf.deinit(allocator);
 
         if (config_file) |cf| {
@@ -109,19 +118,19 @@ pub fn main() !void {
         execute(db, sql);
     } else {
         // REPL Mode
-        const stdin_file = std.fs.cwd().openFile("/dev/stdin", .{}) catch |err| {
+        const stdin_file = std.Io.Dir.cwd().openFile(init.io, "/dev/stdin", .{}) catch |err| {
             std.debug.print("Failed to open stdin: {}\n", .{err});
             return;
         };
-        defer stdin_file.close();
+        defer stdin_file.close(init.io);
 
         var buf: [4096]u8 = undefined;
         std.debug.print("Axion Shell.\nType SQL commands ending with ';'. Type .stats for metrics. Type .exit to quit.\n", .{});
 
-        var query_buf = std.ArrayListUnmanaged(u8){};
+        var query_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer query_buf.deinit(allocator);
 
-        var partial_buf = std.ArrayListUnmanaged(u8){};
+        var partial_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer partial_buf.deinit(allocator);
 
         while (true) {
@@ -131,7 +140,7 @@ pub fn main() !void {
                 std.debug.print("   ...> ", .{});
             }
 
-            const n = stdin_file.read(&buf) catch |err| {
+            const n = stdin_file.readStreaming(init.io, &.{&buf}) catch |err| {
                 std.debug.print("Read error: {}\n", .{err});
                 break;
             };

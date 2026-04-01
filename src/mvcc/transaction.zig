@@ -14,12 +14,13 @@ const CommitRequest = @import("batcher.zig").CommitRequest;
 pub const SHARD_COUNT = 64;
 
 const ActiveTxnShard = struct {
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     map: std.AutoHashMap(u64, u64),
 };
 
 pub const TransactionManager = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     memtable: *MemTable,
     wal: *WAL,
     storage_ptr: *anyopaque,
@@ -35,16 +36,17 @@ pub const TransactionManager = struct {
     active_shards: []ActiveTxnShard,
     next_txn_id: std.atomic.Value(u64),
 
-    pub fn create(allocator: std.mem.Allocator, memtable: *MemTable, wal: *WAL, storage_ptr: *anyopaque, storage_read_fn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, version: u64) anyerror!?SSTable.ValueRef, storage_iterator_fn: *const fn (ptr: *anyopaque, read_version: u64) anyerror!Iterator, storage_latest_ver_fn: *const fn (ptr: *anyopaque, key: []const u8) ?u64, initial_version: u64) !*TransactionManager {
+    pub fn create(allocator: std.mem.Allocator, memtable: *MemTable, wal: *WAL, storage_ptr: *anyopaque, storage_read_fn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, version: u64) anyerror!?SSTable.ValueRef, storage_iterator_fn: *const fn (ptr: *anyopaque, read_version: u64) anyerror!Iterator, storage_latest_ver_fn: *const fn (ptr: *anyopaque, key: []const u8) ?u64, initial_version: u64, io: std.Io) !*TransactionManager {
         const shards = try allocator.alloc(ActiveTxnShard, SHARD_COUNT);
         for (shards) |*s| {
-            s.mutex = std.Thread.Mutex{};
+            s.mutex = .init;
             s.map = std.AutoHashMap(u64, u64).init(allocator);
         }
 
         const self = try allocator.create(TransactionManager);
         self.* = TransactionManager{
             .allocator = allocator,
+            .io = io,
             .memtable = memtable,
             .wal = wal,
             .storage_ptr = storage_ptr,
@@ -58,7 +60,7 @@ pub const TransactionManager = struct {
         };
 
         // Safe to initialize batcher now that self is on heap
-        self.batcher = try CommitBatcher.init(allocator, self);
+        self.batcher = try CommitBatcher.init(allocator, self, io);
 
         return self;
     }
@@ -93,9 +95,9 @@ pub const TransactionManager = struct {
         const shard_idx = id % SHARD_COUNT;
         const shard = &self.active_shards[shard_idx];
 
-        shard.mutex.lock();
+        shard.mutex.lockUncancelable(self.io);
         try shard.map.put(id, ver);
-        shard.mutex.unlock();
+        shard.mutex.unlock(self.io);
 
         return Transaction.init(self.allocator, self, id, ver);
     }
@@ -104,23 +106,23 @@ pub const TransactionManager = struct {
         const shard_idx = id % SHARD_COUNT;
         const shard = &self.active_shards[shard_idx];
 
-        shard.mutex.lock();
+        shard.mutex.lockUncancelable(self.io);
         _ = shard.map.remove(id);
-        shard.mutex.unlock();
+        shard.mutex.unlock(self.io);
     }
 
     pub fn getMinActiveVersion(self: *TransactionManager) u64 {
         var min: u64 = self.global_version.load(.acquire);
 
         for (self.active_shards) |*s| {
-            s.mutex.lock();
+            s.mutex.lockUncancelable(self.io);
             var it = s.map.valueIterator();
             while (it.next()) |ver| {
                 if (ver.* < min) {
                     min = ver.*;
                 }
             }
-            s.mutex.unlock();
+            s.mutex.unlock(self.io);
         }
         return min;
     }
@@ -137,9 +139,9 @@ pub const TransactionManager = struct {
         const shard_idx = id % SHARD_COUNT;
         const shard = &self.active_shards[shard_idx];
 
-        shard.mutex.lock();
+        shard.mutex.lockUncancelable(self.io);
         shard.map.put(id, ver) catch {};
-        shard.mutex.unlock();
+        shard.mutex.unlock(self.io);
 
         return ReadOnlyTransaction{ .id = id, .read_version = ver };
     }
@@ -156,7 +158,7 @@ pub const TransactionManager = struct {
         // Wait for completion
         // Wait on Futex. 0 = Pending, 1 = Done.
         while (req.done.load(.acquire) == 0) {
-            std.Thread.Futex.wait(&req.done, 0);
+            self.io.futexWaitUncancelable(u32, &req.done.raw, 0);
         }
 
         if (req.status == .Conflict) {
@@ -228,10 +230,10 @@ pub const Transaction = struct {
             .id = id,
             .read_version = read_version,
             .buffer = std.StringHashMap([]const u8).init(allocator),
-            .wal_buffer = .{},
+            .wal_buffer = .empty,
             .arena = std.heap.ArenaAllocator.init(allocator),
-            .undo_log = .{},
-            .savepoints = .{},
+            .undo_log = .empty,
+            .savepoints = .empty,
         };
     }
 
@@ -442,17 +444,18 @@ test "Transaction basic flow" {
     const allocator = std.testing.allocator;
 
     // Setup
-    var memtable = try MemTable.init(allocator);
+    const io = std.testing.io;
+    var memtable = try MemTable.init(allocator, io);
     defer memtable.deinit();
 
     const test_path = "test_txn.wal";
-    std.fs.cwd().deleteFile(test_path) catch {};
-    defer std.fs.cwd().deleteFile(test_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
 
-    var wal = try WAL.init(allocator, test_path, .Full);
+    var wal = try WAL.init(allocator, test_path, .Full, io);
     defer wal.deinit();
 
-    var tm = try TransactionManager.create(allocator, memtable, &wal, memtable, mockStorageRead, mockStorageIterator, mockStorageLatestVer, 0);
+    var tm = try TransactionManager.create(allocator, memtable, &wal, memtable, mockStorageRead, mockStorageIterator, mockStorageLatestVer, 0, io);
     defer tm.destroy();
 
     // Txn 1: Insert A=1
@@ -497,17 +500,18 @@ test "Transaction conflict detection" {
     const allocator = std.testing.allocator;
 
     // Setup
-    var memtable = try MemTable.init(allocator);
+    const io = std.testing.io;
+    var memtable = try MemTable.init(allocator, io);
     defer memtable.deinit();
 
     const test_path = "test_txn_conflict.wal";
-    std.fs.cwd().deleteFile(test_path) catch {};
-    defer std.fs.cwd().deleteFile(test_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
 
-    var wal = try WAL.init(allocator, test_path, .Full);
+    var wal = try WAL.init(allocator, test_path, .Full, io);
     defer wal.deinit();
 
-    var tm = try TransactionManager.create(allocator, memtable, &wal, memtable, mockStorageRead, mockStorageIterator, mockStorageLatestVer, 0);
+    var tm = try TransactionManager.create(allocator, memtable, &wal, memtable, mockStorageRead, mockStorageIterator, mockStorageLatestVer, 0, io);
     defer tm.destroy();
 
     // Txn 1: Starts at v1

@@ -7,10 +7,11 @@ test "Integrity Check and Backup API" {
     const db_path = "test_integrity_backup_db";
     const backup_path = "test_integrity_backup_db_bak";
 
-    std.fs.cwd().deleteTree(db_path) catch {};
-    defer std.fs.cwd().deleteTree(db_path) catch {};
-    std.fs.cwd().deleteTree(backup_path) catch {};
-    defer std.fs.cwd().deleteTree(backup_path) catch {};
+    const io = std.testing.io;
+    std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
+    std.Io.Dir.cwd().deleteTree(io, backup_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, backup_path) catch {};
 
     var db: ?*c.sqlite3 = null;
     if (c.sqlite3_open(":memory:", &db) != c.SQLITE_OK) return error.SQLiteOpenFailed;
@@ -47,11 +48,11 @@ test "Integrity Check and Backup API" {
     // 4. Verify Backup (basic check: files exist)
     const backup_db_manifest = try std.fs.path.join(std.testing.allocator, &.{ backup_path, "MANIFEST" });
     defer std.testing.allocator.free(backup_db_manifest);
-    std.fs.cwd().access(backup_db_manifest, .{}) catch return error.ManifestMissing;
+    std.Io.Dir.cwd().access(io, backup_db_manifest, .{}) catch return error.ManifestMissing;
 
     const backup_db_wal = try std.fs.path.join(std.testing.allocator, &.{ backup_path, "WAL" });
     defer std.testing.allocator.free(backup_db_wal);
-    std.fs.cwd().access(backup_db_wal, .{}) catch return error.WALMissing;
+    std.Io.Dir.cwd().access(io, backup_db_wal, .{}) catch return error.WALMissing;
 
     // SSTable check might fail if no flush happened.
     // const backup_db_sst = try std.fs.path.join(std.testing.allocator, &.{backup_path, "table_1.sst"});

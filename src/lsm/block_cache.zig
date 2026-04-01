@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const metrics = @import("../metrics.zig");
 const Allocator = std.mem.Allocator;
 
@@ -20,7 +21,7 @@ pub const BlockCache = struct {
     };
 
     const Shard = struct {
-        mutex: std.Thread.Mutex,
+        mutex: Io.Mutex,
         map: std.AutoHashMap(Key, *Entry),
         head: ?*Entry,
         tail: ?*Entry,
@@ -29,6 +30,7 @@ pub const BlockCache = struct {
     };
 
     allocator: Allocator,
+    io: Io,
     shards: []Shard,
 
     pub const Handle = struct {
@@ -45,12 +47,12 @@ pub const BlockCache = struct {
         }
     };
 
-    pub fn init(allocator: Allocator, capacity_bytes: usize) BlockCache {
+    pub fn init(allocator: Allocator, io: Io, capacity_bytes: usize) BlockCache {
         const shards = allocator.alloc(Shard, SHARD_COUNT) catch @panic("OOM");
         const shard_cap = capacity_bytes / SHARD_COUNT;
 
         for (shards) |*s| {
-            s.mutex = std.Thread.Mutex{};
+            s.mutex = .init;
             s.map = std.AutoHashMap(Key, *Entry).init(allocator);
             s.head = null;
             s.tail = null;
@@ -60,6 +62,7 @@ pub const BlockCache = struct {
 
         return BlockCache{
             .allocator = allocator,
+            .io = io,
             .shards = shards,
         };
     }
@@ -88,8 +91,8 @@ pub const BlockCache = struct {
         const shard_idx = hash % SHARD_COUNT;
         const s = &self.shards[shard_idx];
 
-        s.mutex.lock();
-        defer s.mutex.unlock();
+        s.mutex.lockUncancelable(self.io);
+        defer s.mutex.unlock(self.io);
 
         if (s.map.get(key)) |entry| {
             self.moveToHead(s, entry);
@@ -110,8 +113,8 @@ pub const BlockCache = struct {
         const shard_idx = hash % SHARD_COUNT;
         const s = &self.shards[shard_idx];
 
-        s.mutex.lock();
-        defer s.mutex.unlock();
+        s.mutex.lockUncancelable(self.io);
+        defer s.mutex.unlock(self.io);
 
         if (s.map.get(key)) |entry| {
             self.moveToHead(s, entry);
@@ -217,7 +220,7 @@ pub const BlockCache = struct {
 
 test "BlockCache basic usage" {
     const allocator = std.testing.allocator;
-    var cache = BlockCache.init(allocator, 1024 * 64);
+    var cache = BlockCache.init(allocator, std.testing.io, 1024 * 64);
     defer cache.deinit();
 
     const data1 = try allocator.dupe(u8, "hello");

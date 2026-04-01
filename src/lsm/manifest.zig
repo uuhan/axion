@@ -17,20 +17,22 @@ pub const Manifest = struct {
     };
 
     allocator: Allocator,
+    io: std.Io,
     levels: [MAX_LEVELS]std.ArrayListUnmanaged(TableMetadata),
     next_file_id: u64,
     path: []const u8,
 
-    pub fn init(allocator: Allocator, path: []const u8) !Manifest {
+    pub fn init(allocator: Allocator, io: std.Io, path: []const u8) !Manifest {
         var self = Manifest{
             .allocator = allocator,
+            .io = io,
             .levels = undefined,
             .next_file_id = 1,
             .path = try allocator.dupe(u8, path),
         };
 
         for (&self.levels) |*l| {
-            l.* = .{};
+            l.* = .empty;
         }
 
         // Try load
@@ -122,7 +124,7 @@ pub const Manifest = struct {
     };
 
     fn save(self: *Manifest) !void {
-        var buffer = std.ArrayListUnmanaged(u8){};
+        var buffer: std.ArrayListUnmanaged(u8) = .empty;
         defer buffer.deinit(self.allocator);
 
         var writer = ArrayListWriter{ .list = &buffer, .allocator = self.allocator };
@@ -184,23 +186,24 @@ pub const Manifest = struct {
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path});
         defer self.allocator.free(tmp_path);
 
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        defer file.close();
-        try file.writeAll(buffer.items);
-        try file.sync();
+        const cwd = std.Io.Dir.cwd();
+        const file = try cwd.createFile(self.io, tmp_path, .{});
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, buffer.items);
+        try file.sync(self.io);
 
-        try std.fs.cwd().rename(tmp_path, self.path);
+        try cwd.rename(tmp_path, cwd, self.path, self.io);
     }
 
     pub fn load(self: *Manifest) !void {
-        const file = std.fs.cwd().openFile(self.path, .{}) catch |err| return err;
-        defer file.close();
+        const file = std.Io.Dir.cwd().openFile(self.io, self.path, .{}) catch |err| return err;
+        defer file.close(self.io);
 
-        const size = (try file.stat()).size;
+        const size = (try file.stat(self.io)).size;
         const buffer = try self.allocator.alloc(u8, size);
         defer self.allocator.free(buffer);
 
-        const bytes_read = try readAll(file, buffer);
+        const bytes_read = try readAll(file, self.io, buffer);
         if (bytes_read != buffer.len) return error.UnexpectedEOF;
 
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, buffer, .{});
@@ -258,30 +261,28 @@ pub const Manifest = struct {
         }
     }
 
-    fn readAll(file: std.fs.File, buffer: []u8) !usize {
-        var index: usize = 0;
-        while (index < buffer.len) {
-            const amt = try file.read(buffer[index..]);
-            if (amt == 0) break;
-            index += amt;
-        }
-        return index;
+    fn readAll(file: std.Io.File, io: std.Io, buffer: []u8) !usize {
+        return file.readPositionalAll(io, buffer, 0);
     }
 };
 
 test "Manifest basic flow" {
     const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    var counter: u64 = 42;
     var buf: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buf, "MANIFEST_TEST_{}", .{std.crypto.random.int(u64)});
+    const path = try std.fmt.bufPrint(&buf, "MANIFEST_TEST_{}", .{counter});
+    counter += 1;
 
-    std.fs.cwd().deleteFile(path) catch {};
-    defer std.fs.cwd().deleteFile(path) catch {};
+    cwd.deleteFile(io, path) catch {};
+    defer cwd.deleteFile(io, path) catch {};
 
     {
-        var m = try Manifest.init(allocator, path);
+        var m = try Manifest.init(allocator, io, path);
         defer m.deinit();
 
-        var tables_to_add = std.ArrayListUnmanaged(Manifest.TableMetadata){};
+        var tables_to_add: std.ArrayListUnmanaged(Manifest.TableMetadata) = .empty;
         defer tables_to_add.deinit(allocator);
 
         try tables_to_add.append(allocator, .{
@@ -299,7 +300,7 @@ test "Manifest basic flow" {
     }
 
     {
-        var m = try Manifest.init(allocator, path);
+        var m = try Manifest.init(allocator, io, path);
         defer m.deinit();
 
         try std.testing.expectEqual(m.next_file_id, 2);

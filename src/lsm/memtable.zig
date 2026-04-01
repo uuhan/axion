@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Comparator = @import("comparator.zig");
 
@@ -20,18 +21,20 @@ const Shard = struct {
     allocator: Allocator,
     head: *Node,
     level: usize,
-    lock: std.Thread.RwLock,
+    io: Io,
+    lock: Io.RwLock,
     rng: std.Random.DefaultPrng,
     size_bytes: usize,
 
-    pub fn init(parent_allocator: Allocator) !*Shard {
+    pub fn init(parent_allocator: Allocator, io: Io) !*Shard {
         const self = try parent_allocator.create(Shard);
         self.parent_allocator = parent_allocator;
         self.arena = std.heap.ArenaAllocator.init(parent_allocator);
         self.allocator = self.arena.allocator();
         self.level = 0;
-        self.lock = std.Thread.RwLock{};
-        self.rng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
+        self.io = io;
+        self.lock = .init;
+        self.rng = std.Random.DefaultPrng.init(@as(u64, @intFromPtr(self)));
         self.size_bytes = 0;
 
         self.head = try self.allocator.create(Node);
@@ -59,8 +62,8 @@ const Shard = struct {
     }
 
     pub fn put(self: *Shard, key: []const u8, value: []const u8, version: u64) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
 
         var update: [MAX_LEVEL]?*Node = undefined;
         var current = self.head;
@@ -121,8 +124,8 @@ const Shard = struct {
     }
 
     pub fn get(self: *Shard, key: []const u8, snapshot_version: u64) ?[]const u8 {
-        self.lock.lockShared();
-        defer self.lock.unlockShared();
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
 
         var current = self.head;
         var i: isize = @intCast(self.level);
@@ -153,8 +156,8 @@ const Shard = struct {
     }
 
     pub fn getLatestVersion(self: *Shard, key: []const u8) ?u64 {
-        self.lock.lockShared();
-        defer self.lock.unlockShared();
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
 
         var current = self.head;
         var i: isize = @intCast(self.level);
@@ -191,8 +194,8 @@ const Shard = struct {
 
         pub fn seek(self: *Iterator, key: []const u8) void {
             // Skip List Search for >= key
-            self.shard.lock.lockShared();
-            defer self.shard.lock.unlockShared();
+            self.shard.lock.lockSharedUncancelable(self.shard.io);
+            defer self.shard.lock.unlockShared(self.shard.io);
 
             var current = self.shard.head;
             var i: isize = @intCast(self.shard.level);
@@ -223,8 +226,8 @@ const Shard = struct {
             if (self.current == null) return null;
 
             // Refill Batch
-            self.shard.lock.lockShared();
-            defer self.shard.lock.unlockShared();
+            self.shard.lock.lockSharedUncancelable(self.shard.io);
+            defer self.shard.lock.unlockShared(self.shard.io);
 
             // Re-check current in case it was removed (not possible in append-only, but good practice)
             // Actually, self.current is a pointer. If it's valid, we are good.
@@ -269,17 +272,19 @@ pub const MemTable = struct {
     const SHARD_COUNT = 16;
 
     allocator: Allocator,
+    io: Io,
     shards: [SHARD_COUNT]*Shard,
     count: std.atomic.Value(usize),
     ref_count: std.atomic.Value(usize),
 
-    pub fn init(allocator: Allocator) !*MemTable {
+    pub fn init(allocator: Allocator, io: Io) !*MemTable {
         const self = try allocator.create(MemTable);
         self.allocator = allocator;
+        self.io = io;
         self.count = std.atomic.Value(usize).init(0);
         self.ref_count = std.atomic.Value(usize).init(1);
         for (0..SHARD_COUNT) |i| {
-            self.shards[i] = try Shard.init(allocator);
+            self.shards[i] = try Shard.init(allocator, io);
         }
         return self;
     }
@@ -388,7 +393,7 @@ pub const MemTable = struct {
 
 test "MemTable basic operations" {
     const allocator = std.testing.allocator;
-    var memtable = try MemTable.init(allocator);
+    var memtable = try MemTable.init(allocator, std.testing.io);
     defer memtable.deinit();
 
     try memtable.put("key1", "value1", 10);

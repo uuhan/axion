@@ -113,10 +113,11 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Work
     });
 
     // Clean previous
-    std.fs.cwd().deleteTree(db_path) catch {};
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
 
     // Setup DB
-    var db = DB.open(allocator, db_path, mode) catch |err| {
+    var db = DB.open(allocator, db_path, mode, io) catch |err| {
         std.debug.print("  [Bench] Error opening DB: {}\n", .{err});
         return err;
     };
@@ -180,7 +181,7 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Work
     // Close DB before deleting files
     db.close();
 
-    std.fs.cwd().deleteTree(db_path) catch {};
+    std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
 }
 
 pub fn main() !void {

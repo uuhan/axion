@@ -50,13 +50,13 @@ pub fn HeapMergeIterator(comptime EntryType: type, comptime SourceIteratorType: 
         pending_source_idx: ?usize = null,
 
         pub fn init(allocator: Allocator, sources: []SourceIteratorType) !Self {
-            var heap = PriorityQueue(HeapNode, void, HeapNode.compare).init(allocator, {});
-            errdefer heap.deinit();
+            var heap: PriorityQueue(HeapNode, void, HeapNode.compare) = .empty;
+            errdefer heap.deinit(allocator);
 
             // Pre-fill heap
             for (sources, 0..) |*src, i| {
                 if (try src.next()) |entry| {
-                    try heap.add(.{
+                    try heap.push(allocator, .{
                         .entry = entry,
                         .source_idx = i,
                     });
@@ -72,7 +72,7 @@ pub fn HeapMergeIterator(comptime EntryType: type, comptime SourceIteratorType: 
         }
 
         pub fn deinit(self: *Self) void {
-            self.heap.deinit();
+            self.heap.deinit(self.allocator);
         }
 
         /// Returns the next entry in merged order.
@@ -81,7 +81,7 @@ pub fn HeapMergeIterator(comptime EntryType: type, comptime SourceIteratorType: 
             // This ensures the buffer returned in the previous call was valid until now.
             if (self.pending_source_idx) |idx| {
                 if (try self.sources[idx].next()) |next_entry| {
-                    try self.heap.add(.{
+                    try self.heap.push(self.allocator, .{
                         .entry = next_entry,
                         .source_idx = idx,
                     });
@@ -89,7 +89,7 @@ pub fn HeapMergeIterator(comptime EntryType: type, comptime SourceIteratorType: 
                 self.pending_source_idx = null;
             }
 
-            if (self.heap.removeOrNull()) |node| {
+            if (self.heap.pop()) |node| {
                 self.pending_source_idx = node.source_idx;
                 // Return the entry directly (Zero-Copy).
                 // It is valid until this function is called again.
@@ -103,12 +103,12 @@ pub fn HeapMergeIterator(comptime EntryType: type, comptime SourceIteratorType: 
             self.pending_source_idx = null;
 
             // Clear heap
-            while (self.heap.removeOrNull()) |_| {}
+            while (self.heap.pop()) |_| {}
 
             // Refill
             for (self.sources, 0..) |*src, i| {
                 if (try src.next()) |entry| {
-                    try self.heap.add(.{
+                    try self.heap.push(self.allocator, .{
                         .entry = entry,
                         .source_idx = i,
                     });

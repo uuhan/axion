@@ -4,9 +4,10 @@ const DB = @import("axion").DB;
 const AxionVTab = @import("axion").sqlite.vtab;
 
 test "Secondary Index Range Scan" {
+    const io = std.testing.io;
     const db_path = "test_secondary_idx_db";
-    std.fs.cwd().deleteTree(db_path) catch {};
-    defer std.fs.cwd().deleteTree(db_path) catch {};
+    std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
 
     var db: ?*c.sqlite3 = null;
     if (c.sqlite3_open(":memory:", &db) != c.SQLITE_OK) return error.SQLiteOpenFailed;

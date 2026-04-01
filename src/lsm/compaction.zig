@@ -87,7 +87,7 @@ pub const Compaction = struct {
         max_version: u64,
     };
 
-    pub fn compact(allocator: Allocator, inputs: []const []const u8, dir_path: []const u8, gc_threshold: u64, target_file_size: u64, id_gen_ctx: *anyopaque, id_gen_fn: *const fn (ctx: *anyopaque) u64) !std.ArrayListUnmanaged(CompactResult) {
+    pub fn compact(allocator: Allocator, inputs: []const []const u8, dir_path: []const u8, gc_threshold: u64, target_file_size: u64, id_gen_ctx: *anyopaque, id_gen_fn: *const fn (ctx: *anyopaque) u64, io: std.Io) !std.ArrayListUnmanaged(CompactResult) {
         const readers = try allocator.alloc(*SSTable.Reader, inputs.len);
         var readers_init_count: usize = 0;
 
@@ -111,7 +111,7 @@ pub const Compaction = struct {
         defer allocator.free(iterators);
 
         for (inputs, 0..) |path, i| {
-            readers[i] = try SSTable.Reader.open(allocator, path, null);
+            readers[i] = try SSTable.Reader.open(allocator, path, null, io);
             readers_init_count += 1;
 
             wrappers[i] = SSTableIteratorWrapper.init(readers[i].iterator());
@@ -121,7 +121,7 @@ pub const Compaction = struct {
         var merge_iter = try MergeIterator.init(allocator, iterators);
         defer merge_iter.deinit();
 
-        var results = std.ArrayListUnmanaged(CompactResult){};
+        var results: std.ArrayListUnmanaged(CompactResult) = .empty;
         errdefer {
             for (results.items) |res| {
                 allocator.free(res.min_key);
@@ -135,9 +135,9 @@ pub const Compaction = struct {
         var current_min_key: ?[]u8 = null;
         errdefer if (current_min_key) |k| allocator.free(k);
 
-        var current_key_buf = std.ArrayListUnmanaged(u8){};
+        var current_key_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer current_key_buf.deinit(allocator);
-        var max_key_buf = std.ArrayListUnmanaged(u8){};
+        var max_key_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer max_key_buf.deinit(allocator);
 
         var current_max_version: u64 = 0;
@@ -174,7 +174,7 @@ pub const Compaction = struct {
                     defer allocator.free(path);
 
                     const estimated_count = target_file_size / 100;
-                    current_builder = try SSTable.Builder.init(allocator, path, true, estimated_count, 64 * 1024);
+                    current_builder = try SSTable.Builder.init(allocator, path, true, estimated_count, 64 * 1024, io);
                     current_min_key = try allocator.dupe(u8, entry.key);
                     current_max_version = 0;
                 }
@@ -294,8 +294,8 @@ pub const CompactionPolicy = struct {
 
         var task = Task{
             .level = i,
-            .source_tables = .{},
-            .next_level_tables = .{},
+            .source_tables = .empty,
+            .next_level_tables = .empty,
         };
         // If we fail to construct a valid task (e.g. due to locks), we must cleanup.
         // But wait, if we mark files as compacting, we must own them.
@@ -303,10 +303,10 @@ pub const CompactionPolicy = struct {
         // If any are locked, abort this attempt (return null).
         // Note: This is optimistic.
 
-        var candidates_src = std.ArrayListUnmanaged(*TableInfo){};
+        var candidates_src: std.ArrayListUnmanaged(*TableInfo) = .empty;
         defer candidates_src.deinit(allocator);
 
-        var candidates_next = std.ArrayListUnmanaged(*TableInfo){};
+        var candidates_next: std.ArrayListUnmanaged(*TableInfo) = .empty;
         defer candidates_next.deinit(allocator);
 
         if (i == 0) {
@@ -409,25 +409,27 @@ test "Compaction basic flow" {
     // but Compaction.compact works on paths and is largely unchanged.
     // We can keep this test as is.
     const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
     const path1 = "t1.sst";
     const path2 = "t2.sst";
     const dir = ".";
 
     defer {
-        std.fs.cwd().deleteFile(path1) catch {};
-        std.fs.cwd().deleteFile(path2) catch {};
-        std.fs.cwd().deleteFile("table_100.sst") catch {};
+        cwd.deleteFile(io, path1) catch {};
+        cwd.deleteFile(io, path2) catch {};
+        cwd.deleteFile(io, "table_100.sst") catch {};
     }
 
     {
-        var b = try SSTable.Builder.init(allocator, path1, true, 1, 4096);
+        var b = try SSTable.Builder.init(allocator, path1, true, 1, 4096, io);
         try b.add("key1", "val1_v10", 10);
         _ = try b.finish();
         b.deinit();
     }
 
     {
-        var b = try SSTable.Builder.init(allocator, path2, true, 2, 4096);
+        var b = try SSTable.Builder.init(allocator, path2, true, 2, 4096, io);
         try b.add("key1", "val1_v20", 20);
         try b.add("key2", "val2_v20", 20);
         _ = try b.finish();
@@ -436,7 +438,7 @@ test "Compaction basic flow" {
 
     const inputs = [_][]const u8{ path1, path2 };
     var id_gen = MockIdGen{};
-    var results = try Compaction.compact(allocator, &inputs, dir, 15, 1024 * 1024, &id_gen, MockIdGen.gen);
+    var results = try Compaction.compact(allocator, &inputs, dir, 15, 1024 * 1024, &id_gen, MockIdGen.gen, io);
     defer {
         for (results.items) |r| {
             allocator.free(r.min_key);

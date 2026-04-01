@@ -6,11 +6,12 @@ const builtin = @import("builtin");
 const RecordFormat = @import("wal/record.zig").RecordFormat;
 
 pub const WAL = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     allocator: std.mem.Allocator,
+    io: std.Io,
     sync_mode: SyncMode,
-    mutex: std.Thread.Mutex,
-    cond: std.Thread.Condition,
+    mutex: std.Io.Mutex,
+    cond: std.Io.Condition,
 
     // Group Commit fields
     buffer: std.ArrayListUnmanaged(u8),
@@ -34,19 +35,19 @@ pub const WAL = struct {
         Off,
     };
 
-    pub fn init(allocator: std.mem.Allocator, path: []const u8, sync_mode: SyncMode) !WAL {
-        const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = false });
-        const end_pos = try file.getEndPos();
-        try file.seekTo(end_pos);
+    pub fn init(allocator: std.mem.Allocator, path: []const u8, sync_mode: SyncMode, io: std.Io) !WAL {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+        const end_pos = try file.length(io);
 
         var self = WAL{
             .file = file,
             .allocator = allocator,
+            .io = io,
             .sync_mode = sync_mode,
-            .mutex = std.Thread.Mutex{},
-            .cond = std.Thread.Condition{},
-            .buffer = .{},
-            .flush_buffer = .{},
+            .mutex = .init,
+            .cond = .init,
+            .buffer = .empty,
+            .flush_buffer = .empty,
             .current_sync_version = 0,
             .max_buffered_version = 0,
             .is_flushing = false,
@@ -76,7 +77,7 @@ pub const WAL = struct {
         if (builtin.os.tag == .linux and self.use_uring) {
             self.ring.deinit();
         }
-        self.file.close();
+        self.file.close(self.io);
         self.buffer.deinit(self.allocator);
         self.flush_buffer.deinit(self.allocator);
     }
@@ -87,8 +88,8 @@ pub const WAL = struct {
     }
 
     pub fn appendRaw(self: *WAL, raw_data: []const u8, version: u64) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         try self.buffer.appendSlice(self.allocator, raw_data);
 
@@ -98,12 +99,12 @@ pub const WAL = struct {
     }
 
     fn performSyncFlush(self: *WAL, data: []const u8) void {
-        self.file.writeAll(data) catch |err| {
+        self.file.writePositionalAll(self.io, data, self.file_offset) catch |err| {
             log.err(.wal, "WAL Flush Error: {}", .{err});
         };
 
         if (self.sync_mode == .Full) {
-            self.file.sync() catch |err| {
+            self.file.sync(self.io) catch |err| {
                 log.err(.wal, "WAL Sync Error: {}", .{err});
             };
         }
@@ -112,8 +113,8 @@ pub const WAL = struct {
     // Async Pipelining API
     pub fn submitFlush(self: *WAL, version: u64) !void {
         _ = version;
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.is_flushing) return error.FlushInProgress;
 
@@ -157,8 +158,8 @@ pub const WAL = struct {
     }
 
     pub fn completeFlush(self: *WAL) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (!self.is_flushing) return;
 
@@ -180,7 +181,7 @@ pub const WAL = struct {
         self.current_sync_version = self.flushing_version;
         self.is_flushing = false;
         self.flush_buffer.clearRetainingCapacity();
-        self.cond.broadcast();
+        self.cond.broadcast(self.io);
     }
 
     fn submitWriteAsync(self: *WAL, data: []const u8, link_fsync: bool) !u32 {
@@ -216,13 +217,13 @@ pub const WAL = struct {
     }
 
     pub fn waitForDurability(self: *WAL, version: u64) !void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
 
         if (self.current_sync_version >= version) {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return;
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         try self.submitFlush(version);
         try self.completeFlush();
@@ -233,17 +234,17 @@ pub const WAL = struct {
         var max_version: u64 = 0;
 
         // Reusable buffer for keys and values to avoid small allocs
-        var temp_buffer = std.ArrayListUnmanaged(u8){};
+        var temp_buffer: std.ArrayListUnmanaged(u8) = .empty;
         defer temp_buffer.deinit(self.allocator);
 
         while (true) {
             const record_start = pos;
             // Header: CRC(4), Ver(8), KLen(4), VLen(4) = 20 bytes
             var header: [20]u8 = undefined;
-            const n_head = try self.file.preadAll(&header, record_start);
+            const n_head = try self.file.readPositionalAll(self.io, &header, record_start);
             if (n_head == 0) break; // Clean EOF
             if (n_head < 20) {
-                try self.file.setEndPos(record_start);
+                try self.file.setLength(self.io, record_start);
                 pos = record_start;
                 break;
             }
@@ -259,9 +260,9 @@ pub const WAL = struct {
             try temp_buffer.resize(self.allocator, key_len + val_len);
 
             // Read payload
-            const n_payload = try self.file.preadAll(temp_buffer.items, pos);
+            const n_payload = try self.file.readPositionalAll(self.io, temp_buffer.items, pos);
             if (n_payload < temp_buffer.items.len) {
-                try self.file.setEndPos(record_start);
+                try self.file.setLength(self.io, record_start);
                 pos = record_start;
                 break;
             }
@@ -292,7 +293,6 @@ pub const WAL = struct {
             }
         }
 
-        try self.file.seekTo(pos);
         self.file_offset = pos;
 
         self.current_sync_version = max_version;
@@ -308,22 +308,21 @@ pub const WAL = struct {
 
 test "WAL group commit flow" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var rnd = std.crypto.random;
-    var buf: [64]u8 = undefined;
-    const test_path = try std.fmt.bufPrint(&buf, "test_gc_{x}.wal", .{rnd.int(u64)});
+    const test_path = "test_gc_groupcommit.wal";
 
-    std.fs.cwd().deleteFile(test_path) catch {};
-    defer std.fs.cwd().deleteFile(test_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
 
-    var wal = try WAL.init(allocator, test_path, .Full);
+    var wal = try WAL.init(allocator, test_path, .Full, io);
     defer wal.deinit();
 
-    var buf1 = std.ArrayListUnmanaged(u8){};
+    var buf1: std.ArrayListUnmanaged(u8) = .empty;
     defer buf1.deinit(allocator);
     try WAL.serializeEntry(&buf1, allocator, "k1", "v1", 10);
 
-    var buf2 = std.ArrayListUnmanaged(u8){};
+    var buf2: std.ArrayListUnmanaged(u8) = .empty;
     defer buf2.deinit(allocator);
     try WAL.serializeEntry(&buf2, allocator, "k2", "v2", 11);
 
@@ -341,9 +340,9 @@ test "WAL group commit flow" {
     try wal.waitForDurability(11);
 
     // Verify Replay
-    var wal2 = try WAL.init(allocator, test_path, .Full);
+    var wal2 = try WAL.init(allocator, test_path, .Full, io);
     defer wal2.deinit();
-    var memtable = try MemTable.init(allocator);
+    var memtable = try MemTable.init(allocator, io);
     defer memtable.deinit();
 
     const max_ver = try wal2.replay(memtable, 0);
@@ -360,19 +359,18 @@ test "WAL group commit flow" {
 
 test "WAL recovery with partial write" {
     const allocator = std.testing.allocator;
-    var rnd = std.crypto.random;
-    var buf: [64]u8 = undefined;
-    const test_path = try std.fmt.bufPrint(&buf, "test_wal_partial_{x}.log", .{rnd.int(u64)});
+    const io = std.testing.io;
+    const test_path = "test_wal_partial_recovery.log";
 
-    std.fs.cwd().deleteFile(test_path) catch {};
-    defer std.fs.cwd().deleteFile(test_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
 
     // 1. Write valid data
     {
-        var wal = try WAL.init(allocator, test_path, .Full);
+        var wal = try WAL.init(allocator, test_path, .Full, io);
         defer wal.deinit();
 
-        var batch = std.ArrayListUnmanaged(u8){};
+        var batch: std.ArrayListUnmanaged(u8) = .empty;
         defer batch.deinit(allocator);
 
         // Entry 1 (v10)
@@ -388,9 +386,9 @@ test "WAL recovery with partial write" {
 
     // 2. Append garbage
     {
-        const file = try std.fs.cwd().openFile(test_path, .{ .mode = .read_write });
-        defer file.close();
-        try file.seekFromEnd(0);
+        const file = try std.Io.Dir.cwd().openFile(io, test_path, .{ .mode = .read_write });
+        defer file.close(io);
+        const end_pos = try file.length(io);
         // Append partial header (less than 4 bytes CRC, or partial fields)
         // A CRC is 4 bytes. If we write 3 bytes, replay loop checks `n < 4` and breaks safely.
         // Let's write enough to pass first check but fail later (e.g., CRC OK, but partial key).
@@ -398,15 +396,15 @@ test "WAL recovery with partial write" {
         // The goal is "partial write", meaning sudden power loss.
         // This usually looks like a truncated record at the end.
         const garbage = "par";
-        try file.writeAll(garbage);
+        try file.writePositionalAll(io, garbage, end_pos);
     }
 
     // 3. Replay
     {
-        var wal = try WAL.init(allocator, test_path, .Full);
+        var wal = try WAL.init(allocator, test_path, .Full, io);
         defer wal.deinit();
 
-        var mem = try MemTable.init(allocator);
+        var mem = try MemTable.init(allocator, io);
         defer mem.deinit();
 
         const max_ver = try wal.replay(mem, 0);
@@ -419,18 +417,18 @@ test "WAL recovery with partial write" {
         }
 
         const expected_record_size: u64 = RecordFormat.HEADER_SIZE + "key1".len + "val1".len;
-        const stat_after_replay = try wal.file.stat();
+        const stat_after_replay = try wal.file.stat(io);
         try std.testing.expectEqual(expected_record_size, stat_after_replay.size);
 
-        var batch2 = std.ArrayListUnmanaged(u8){};
+        var batch2: std.ArrayListUnmanaged(u8) = .empty;
         defer batch2.deinit(allocator);
         try WAL.serializeEntry(&batch2, allocator, "key2", "val2", 11);
         try wal.appendRaw(batch2.items, 11);
         try wal.waitForDurability(11);
 
-        var wal3 = try WAL.init(allocator, test_path, .Full);
+        var wal3 = try WAL.init(allocator, test_path, .Full, io);
         defer wal3.deinit();
-        var mem2 = try MemTable.init(allocator);
+        var mem2 = try MemTable.init(allocator, io);
         defer mem2.deinit();
 
         const max_ver2 = try wal3.replay(mem2, 0);
@@ -448,7 +446,7 @@ test "WAL recovery with partial write" {
         }
 
         const expected_total_size: u64 = expected_record_size + RecordFormat.HEADER_SIZE + "key2".len + "val2".len;
-        const stat_after_append = try wal3.file.stat();
+        const stat_after_append = try wal3.file.stat(io);
         try std.testing.expectEqual(expected_total_size, stat_after_append.size);
     }
 }

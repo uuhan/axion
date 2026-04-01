@@ -110,6 +110,7 @@ fn worker(workload: Config.Workload, seed: u64, key_count: usize) void {
 
 fn runBenchmark(allocator: std.mem.Allocator, mode: Config.Mode, workload: Config.Workload, config: Config.BenchmarkConfig) !void {
     const db_path = Config.DB_PATH_SQLITE;
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     std.debug.print("  [SQLite] {s} - {s} (Threads: {}, Keys: {})...\n", .{
         switch (mode) {
@@ -123,9 +124,9 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: Config.Mode, workload: Confi
     });
 
     // Clean previous
-    std.fs.cwd().deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile("bench_sqlite.db-wal") catch {};
-    std.fs.cwd().deleteFile("bench_sqlite.db-shm") catch {};
+    std.Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, "bench_sqlite.db-wal") catch {};
+    std.Io.Dir.cwd().deleteFile(io, "bench_sqlite.db-shm") catch {};
 
     // Setup DB
     var db: ?*c.sqlite3 = null;
@@ -172,7 +173,7 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: Config.Mode, workload: Confi
     ops_count.store(0, .monotonic);
     should_stop.store(false, .monotonic);
 
-    var threads = std.ArrayListUnmanaged(std.Thread){};
+    var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
     defer threads.deinit(allocator);
 
     var i: usize = 0;
@@ -190,16 +191,16 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: Config.Mode, workload: Confi
     const qps = total / config.duration;
     std.debug.print("  Result: {d} ops/sec\n", .{qps});
 
-    std.fs.cwd().deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile("bench_sqlite.db-wal") catch {};
-    std.fs.cwd().deleteFile("bench_sqlite.db-shm") catch {};
+    std.Io.Dir.cwd().deleteFile(io, db_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, "bench_sqlite.db-wal") catch {};
+    std.Io.Dir.cwd().deleteFile(io, "bench_sqlite.db-shm") catch {};
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = std.heap.c_allocator;
     std.debug.print("Running Native SQLite Benchmarks\n", .{});
 
-    const config = try Config.BenchmarkConfig.parseArgs(allocator);
+    const config = try Config.BenchmarkConfig.parseArgs(init.args);
 
     const modes = [_]Config.Mode{ .Full, .Normal, .Off };
     const workloads = [_]Config.Workload{ .Write, .SeqWrite, .Read, .RangeScan, .Mix };

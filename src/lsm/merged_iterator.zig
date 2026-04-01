@@ -17,9 +17,9 @@ pub const MergedIterator = struct {
     pub fn init(allocator: std.mem.Allocator, read_version: u64) MergedIterator {
         return .{
             .allocator = allocator,
-            .children = .{},
-            .child_entries = .{},
-            .heap = .{},
+            .children = .empty,
+            .child_entries = .empty,
+            .heap = .empty,
             .read_version = read_version,
             .last_key = null,
             .next_child_to_advance = null,

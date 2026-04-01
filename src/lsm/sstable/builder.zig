@@ -8,7 +8,8 @@ const lz4 = @cImport({
 });
 
 pub const Builder = struct {
-    file: std.fs.File,
+    file: std.Io.File,
+    io: std.Io,
     allocator: Allocator,
     current_block: std.ArrayListUnmanaged(u8),
     index: std.ArrayListUnmanaged(Format.IndexEntry),
@@ -16,6 +17,7 @@ pub const Builder = struct {
     restart_counter: usize,
     bloom: BloomFilter,
     block_start_offset: u64,
+    write_offset: u64,
     enable_compression: bool,
     last_key: std.ArrayListUnmanaged(u8),
 
@@ -24,25 +26,27 @@ pub const Builder = struct {
     block_size: usize,
     finished: bool,
 
-    pub fn init(allocator: Allocator, path: []const u8, enable_compression: bool, expected_elements: usize, block_size: usize) !Builder {
+    pub fn init(allocator: Allocator, path: []const u8, enable_compression: bool, expected_elements: usize, block_size: usize, io: std.Io) !Builder {
         const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
         errdefer allocator.free(temp_path);
 
-        const file = try std.fs.cwd().createFile(temp_path, .{ .read = true, .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{ .read = true });
 
         const bloom_elements = if (expected_elements > 0) expected_elements else 1000;
 
         var b = Builder{
             .file = file,
+            .io = io,
             .allocator = allocator,
-            .current_block = .{},
-            .index = .{},
-            .restarts = .{},
+            .current_block = .empty,
+            .index = .empty,
+            .restarts = .empty,
             .restart_counter = 0,
             .bloom = try BloomFilter.init(allocator, bloom_elements),
             .block_start_offset = 0,
+            .write_offset = 0,
             .enable_compression = enable_compression,
-            .last_key = .{},
+            .last_key = .empty,
             .final_path = try allocator.dupe(u8, path),
             .temp_path = temp_path,
             .block_size = if (block_size > 0) block_size else Format.BLOCK_SIZE,
@@ -54,8 +58,8 @@ pub const Builder = struct {
 
     pub fn deinit(self: *Builder) void {
         if (!self.finished) {
-            self.file.close();
-            std.fs.cwd().deleteFile(self.temp_path) catch {};
+            self.file.close(self.io);
+            std.Io.Dir.cwd().deleteFile(self.io, self.temp_path) catch {};
         }
 
         self.allocator.free(self.temp_path);
@@ -177,17 +181,21 @@ pub const Builder = struct {
         const checksum = Crc32.hash(compressed_slice);
 
         var type_buf: [1]u8 = .{compression_type};
-        try self.file.writeAll(&type_buf);
+        try self.file.writePositionalAll(self.io, &type_buf, self.write_offset);
+        self.write_offset += 1;
 
         var len_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_buf, @as(u32, @intCast(uncompressed_len)), .little);
-        try self.file.writeAll(&len_buf);
+        try self.file.writePositionalAll(self.io, &len_buf, self.write_offset);
+        self.write_offset += 4;
 
-        try self.file.writeAll(compressed_slice);
+        try self.file.writePositionalAll(self.io, compressed_slice, self.write_offset);
+        self.write_offset += compressed_slice.len;
 
         var crc_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &crc_buf, checksum, .little);
-        try self.file.writeAll(&crc_buf);
+        try self.file.writePositionalAll(self.io, &crc_buf, self.write_offset);
+        self.write_offset += 4;
 
         const total_written = 1 + 4 + @as(u32, @intCast(compressed_slice.len)) + 4;
 
@@ -200,14 +208,18 @@ pub const Builder = struct {
     }
 
     const FileWriter = struct {
-        file: std.fs.File,
+        file: std.Io.File,
+        io: std.Io,
+        offset: *u64,
         pub fn writeAll(self: FileWriter, bytes: []const u8) !void {
-            try self.file.writeAll(bytes);
+            try self.file.writePositionalAll(self.io, bytes, self.offset.*);
+            self.offset.* += bytes.len;
         }
         pub fn writeInt(self: FileWriter, comptime T: type, value: T, endian: std.builtin.Endian) !void {
             var bytes: [@sizeOf(T)]u8 = undefined;
             std.mem.writeInt(T, &bytes, value, endian);
-            try self.file.writeAll(&bytes);
+            try self.file.writePositionalAll(self.io, &bytes, self.offset.*);
+            self.offset.* += @sizeOf(T);
         }
     };
 
@@ -216,9 +228,9 @@ pub const Builder = struct {
 
         try self.flushBlock();
 
-        const index_offset = try self.file.getPos();
+        const index_offset = self.write_offset;
 
-        var writer = FileWriter{ .file = self.file };
+        var writer = FileWriter{ .file = self.file, .io = self.io, .offset = &self.write_offset };
         try writer.writeInt(u32, @as(u32, @intCast(self.index.items.len)), .little);
         for (self.index.items) |entry| {
             try writer.writeInt(u32, @as(u32, @intCast(entry.key.len)), .little);
@@ -227,7 +239,7 @@ pub const Builder = struct {
             try writer.writeInt(u32, entry.length, .little);
         }
 
-        const filter_offset = try self.file.getPos();
+        const filter_offset = self.write_offset;
         try self.bloom.write(writer);
 
         try writer.writeInt(u64, index_offset, .little);
@@ -235,10 +247,10 @@ pub const Builder = struct {
         try writer.writeInt(u64, Format.MAGIC, .little);
         try writer.writeInt(u32, Format.VERSION, .little);
 
-        const final_size = try self.file.getPos();
+        const final_size = self.write_offset;
 
-        self.file.close();
-        try std.fs.cwd().rename(self.temp_path, self.final_path);
+        self.file.close(self.io);
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), self.temp_path, std.Io.Dir.cwd(), self.final_path, self.io);
 
         self.finished = true;
         return final_size;

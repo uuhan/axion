@@ -128,13 +128,14 @@ fn worker(workload: Config.Workload, seed: u64, key_count: usize, mode_str: []co
 }
 
 fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Config.Workload, config: Config.BenchmarkConfig) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
     std.debug.print("  [VTab] {s} - {s}...\n", .{ switch (mode) {
         .Full => "FULL",
         .Normal => "NORMAL",
         .Off => "OFF",
     }, @tagName(workload) });
 
-    std.fs.cwd().deleteTree(Config.DB_PATH_VTAB) catch |err| {
+    std.Io.Dir.cwd().deleteTree(io, Config.DB_PATH_VTAB) catch |err| {
         if (err != error.FileNotFound) {
             std.debug.print("Failed to delete old DB: {}\n", .{err});
             return err;
@@ -213,7 +214,7 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Conf
     ops_count.store(0, .monotonic);
     should_stop.store(false, .monotonic);
 
-    var threads = std.ArrayListUnmanaged(std.Thread){};
+    var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
     defer threads.deinit(allocator);
 
     const mode_str = switch (mode) {
@@ -237,7 +238,7 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Conf
     const qps = total / config.duration;
     std.debug.print("  Result: {d} ops/sec\n", .{qps});
 
-    std.fs.cwd().deleteTree(Config.DB_PATH_VTAB) catch |err| {
+    std.Io.Dir.cwd().deleteTree(io, Config.DB_PATH_VTAB) catch |err| {
         if (err != error.FileNotFound) {
             std.debug.print("Failed to delete old DB: {}\n", .{err});
             return err;
@@ -245,11 +246,11 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Conf
     };
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = std.heap.c_allocator;
     std.debug.print("Running Axion VTab Benchmarks\n", .{});
 
-    const config = try Config.BenchmarkConfig.parseArgs(allocator);
+    const config = try Config.BenchmarkConfig.parseArgs(init.args);
 
     const modes = [_]WAL.SyncMode{ .Full, .Normal, .Off };
     const workloads = [_]Config.Workload{ .Write, .SeqWrite, .Read, .RangeScan, .Mix };

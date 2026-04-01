@@ -102,8 +102,10 @@ fn xConnect(
         }
     }
 
-    types.db_registry_mutex.lock();
-    defer types.db_registry_mutex.unlock();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    types.db_registry_mutex.lockUncancelable(io);
+    defer types.db_registry_mutex.unlock(io);
 
     if (types.db_registry == null) {
         types.db_registry = std.StringHashMap(*types.SharedDB).init(allocator);
@@ -117,7 +119,7 @@ fn xConnect(
         shared.ref_count += 1;
         axion_db = shared.db;
     } else {
-        axion_db = DB.open(allocator, path, db_opts) catch |err| {
+        axion_db = DB.open(allocator, path, db_opts, io) catch |err| {
             pzErr.* = c.sqlite3_mprintf("DB.open failed: %s", @errorName(err).ptr);
             return c.SQLITE_ERROR;
         };
@@ -198,7 +200,7 @@ fn xConnect(
     }
     vtab.schema = schema;
 
-    var sql_buf = std.ArrayListUnmanaged(u8){};
+    var sql_buf = std.ArrayListUnmanaged(u8).empty;
     defer sql_buf.deinit(allocator);
 
     const s1 = std.fmt.allocPrint(allocator, "CREATE TABLE x(", .{}) catch return c.SQLITE_NOMEM;
@@ -242,20 +244,20 @@ fn xConnect(
     const t_name_c = argv[2];
     const t_name = std.mem.span(t_name_c);
 
-    types.vtab_registry_mutex.lock();
+    types.vtab_registry_mutex.lockUncancelable(io);
     if (types.vtab_registry == null) {
         types.vtab_registry = std.StringHashMap(*types.AxionVTab).init(allocator);
     }
     const reg_key = types.getVTabRegistryKey(allocator, db.?, t_name) catch {
-        types.vtab_registry_mutex.unlock();
+        types.vtab_registry_mutex.unlock(io);
         return c.SQLITE_NOMEM;
     };
     types.vtab_registry.?.put(reg_key, vtab) catch {
-        types.vtab_registry_mutex.unlock();
+        types.vtab_registry_mutex.unlock(io);
         allocator.free(reg_key);
         return c.SQLITE_NOMEM;
     };
-    types.vtab_registry_mutex.unlock();
+    types.vtab_registry_mutex.unlock(io);
 
     _ = c.sqlite3_overload_function(db, "axion_backup", -1);
 
@@ -268,12 +270,13 @@ fn xConnect(
 
 fn xDisconnect(vtab: [*c]c.sqlite3_vtab) callconv(.c) c_int {
     const self = @as(*types.AxionVTab, @ptrCast(vtab));
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     // Unregister from vtab_registry
-    types.vtab_registry_mutex.lock();
+    types.vtab_registry_mutex.lockUncancelable(io);
     if (types.vtab_registry) |*map| {
         const key = types.getVTabRegistryKey(allocator, self.sqlite_conn, self.schema.name) catch {
-            types.vtab_registry_mutex.unlock();
+            types.vtab_registry_mutex.unlock(io);
             return c.SQLITE_ERROR;
         };
         defer allocator.free(key);
@@ -281,13 +284,13 @@ fn xDisconnect(vtab: [*c]c.sqlite3_vtab) callconv(.c) c_int {
             allocator.free(kv.key);
         }
     }
-    types.vtab_registry_mutex.unlock();
+    types.vtab_registry_mutex.unlock(io);
 
     self.schema.deinit();
     allocator.destroy(self.schema);
 
-    types.db_registry_mutex.lock();
-    defer types.db_registry_mutex.unlock();
+    types.db_registry_mutex.lockUncancelable(io);
+    defer types.db_registry_mutex.unlock(io);
 
     const path_slice = std.mem.span(self.path_copy);
 
@@ -449,12 +452,13 @@ fn xBestIndex(vtab: [*c]c.sqlite3_vtab, info: [*c]c.sqlite3_index_info) callconv
 
 fn xBegin(vtab: [*c]c.sqlite3_vtab) callconv(.c) c_int {
     const self = @as(*types.AxionVTab, @ptrCast(vtab));
-    types.registry_init_once.call();
+    types.ensureRegistryInit();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     const key = types.RegistryKey{ .conn = self.sqlite_conn, .db = self.db };
     const shard = types.registry.getShard(key);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
+    shard.mutex.lockUncancelable(io);
+    defer shard.mutex.unlock(io);
 
     if (shard.map.getPtr(key)) |entry| {
         // Join existing transaction
@@ -480,12 +484,13 @@ fn xBegin(vtab: [*c]c.sqlite3_vtab) callconv(.c) c_int {
 
 fn xCommit(vtab: [*c]c.sqlite3_vtab) callconv(.c) c_int {
     const self = @as(*types.AxionVTab, @ptrCast(vtab));
-    types.registry_init_once.call();
+    types.ensureRegistryInit();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     const key = types.RegistryKey{ .conn = self.sqlite_conn, .db = self.db };
     const shard = types.registry.getShard(key);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
+    shard.mutex.lockUncancelable(io);
+    defer shard.mutex.unlock(io);
 
     if (shard.map.getPtr(key)) |entry| {
         if (entry.rolled_back) {
@@ -513,12 +518,13 @@ fn xCommit(vtab: [*c]c.sqlite3_vtab) callconv(.c) c_int {
 
 fn xRollback(vtab: [*c]c.sqlite3_vtab) callconv(.c) c_int {
     const self = @as(*types.AxionVTab, @ptrCast(vtab));
-    types.registry_init_once.call();
+    types.ensureRegistryInit();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     const key = types.RegistryKey{ .conn = self.sqlite_conn, .db = self.db };
     const shard = types.registry.getShard(key);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
+    shard.mutex.lockUncancelable(io);
+    defer shard.mutex.unlock(io);
 
     if (shard.map.getPtr(key)) |entry| {
         if (!entry.rolled_back) {
@@ -549,21 +555,22 @@ fn xUpdate(vtab: [*c]c.sqlite3_vtab, argc: c_int, argv: [*c]?*c.sqlite3_value, p
     var txn_ptr: *Transaction = undefined;
     var local_txn = false;
 
-    types.registry_init_once.call();
+    types.ensureRegistryInit();
+    const io = std.Io.Threaded.global_single_threaded.io();
     const key = types.RegistryKey{ .conn = self.sqlite_conn, .db = self.db };
     const shard = types.registry.getShard(key);
 
     {
-        shard.mutex.lock();
+        shard.mutex.lockUncancelable(io);
         if (shard.map.getPtr(key)) |entry| {
             if (entry.rolled_back) {
-                shard.mutex.unlock();
+                shard.mutex.unlock(io);
                 return c.SQLITE_ABORT;
             }
             txn_ptr = entry.txn;
-            shard.mutex.unlock();
+            shard.mutex.unlock(io);
         } else {
-            shard.mutex.unlock();
+            shard.mutex.unlock(io);
             const t = self.db.beginTransaction() catch return c.SQLITE_ERROR;
             txn_ptr = allocator.create(Transaction) catch return c.SQLITE_NOMEM;
             txn_ptr.* = t;
@@ -594,7 +601,7 @@ fn xUpdate(vtab: [*c]c.sqlite3_vtab, argc: c_int, argv: [*c]?*c.sqlite3_value, p
             const old_values = Row.Row.deserializeBorrowed(arena_alloc, ref.data) catch return c.SQLITE_NOMEM;
 
             for (self.schema.indexes.items) |idx| {
-                var idx_values = std.ArrayListUnmanaged([]const u8){};
+                var idx_values = std.ArrayListUnmanaged([]const u8).empty;
                 defer idx_values.deinit(arena_alloc);
 
                 var valid_idx = true;
@@ -631,7 +638,7 @@ fn xUpdate(vtab: [*c]c.sqlite3_vtab, argc: c_int, argv: [*c]?*c.sqlite3_value, p
             txn_ptr.delete(pk) catch |err| return types.mapZigError(err);
         }
     } else {
-        var values = std.ArrayListUnmanaged(Row.Row.Value){};
+        var values = std.ArrayListUnmanaged(Row.Row.Value).empty;
         defer values.deinit(arena_alloc);
 
         var new_pk_bytes: []u8 = undefined;
@@ -679,7 +686,7 @@ fn xUpdate(vtab: [*c]c.sqlite3_vtab, argc: c_int, argv: [*c]?*c.sqlite3_value, p
 
         // Add new index entries
         for (self.schema.indexes.items) |idx| {
-            var idx_values = std.ArrayListUnmanaged([]const u8){};
+            var idx_values = std.ArrayListUnmanaged([]const u8).empty;
             defer idx_values.deinit(arena_alloc);
 
             for (idx.column_ids.items) |cid| {
@@ -754,12 +761,13 @@ fn xRename(vtab: [*c]c.sqlite3_vtab, zNewName: [*c]const u8) callconv(.c) c_int 
 
 fn xSavepoint(vtab: [*c]c.sqlite3_vtab, iSavepoint: c_int) callconv(.c) c_int {
     const self = @as(*types.AxionVTab, @ptrCast(vtab));
-    types.registry_init_once.call();
+    types.ensureRegistryInit();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     const key = types.RegistryKey{ .conn = self.sqlite_conn, .db = self.db };
     const shard = types.registry.getShard(key);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
+    shard.mutex.lockUncancelable(io);
+    defer shard.mutex.unlock(io);
 
     var txn_ptr: *Transaction = undefined;
 
@@ -788,12 +796,13 @@ fn xSavepoint(vtab: [*c]c.sqlite3_vtab, iSavepoint: c_int) callconv(.c) c_int {
 
 fn xRelease(vtab: [*c]c.sqlite3_vtab, iSavepoint: c_int) callconv(.c) c_int {
     const self = @as(*types.AxionVTab, @ptrCast(vtab));
-    types.registry_init_once.call();
+    types.ensureRegistryInit();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     const key = types.RegistryKey{ .conn = self.sqlite_conn, .db = self.db };
     const shard = types.registry.getShard(key);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
+    shard.mutex.lockUncancelable(io);
+    defer shard.mutex.unlock(io);
 
     if (shard.map.getPtr(key)) |entry| {
         if (!entry.rolled_back) {
@@ -805,12 +814,13 @@ fn xRelease(vtab: [*c]c.sqlite3_vtab, iSavepoint: c_int) callconv(.c) c_int {
 
 fn xRollbackTo(vtab: [*c]c.sqlite3_vtab, iSavepoint: c_int) callconv(.c) c_int {
     const self = @as(*types.AxionVTab, @ptrCast(vtab));
-    types.registry_init_once.call();
+    types.ensureRegistryInit();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     const key = types.RegistryKey{ .conn = self.sqlite_conn, .db = self.db };
     const shard = types.registry.getShard(key);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
+    shard.mutex.lockUncancelable(io);
+    defer shard.mutex.unlock(io);
 
     if (shard.map.getPtr(key)) |entry| {
         if (!entry.rolled_back) {
@@ -838,7 +848,7 @@ fn xIntegrity(vtab: [*c]c.sqlite3_vtab, zSchema: [*c]const u8, zTabName: [*c]con
             defer allocator.free(sst_path);
 
             var reader: *SSTable.Reader = undefined;
-            if (SSTable.Reader.open(allocator, sst_path, self.db.versions.block_cache)) |r| {
+            if (SSTable.Reader.open(allocator, sst_path, self.db.versions.block_cache, self.db.io)) |r| {
                 reader = r;
             } else |err| {
                 pzErr.* = c.sqlite3_mprintf("SSTable %d open error: %s", table_info.id, @errorName(err).ptr);
@@ -861,10 +871,10 @@ fn xIntegrity(vtab: [*c]c.sqlite3_vtab, zSchema: [*c]const u8, zTabName: [*c]con
     const wal_path = std.fs.path.join(allocator, &.{ self.db.db_path, "WAL" }) catch return c.SQLITE_ERROR;
     defer allocator.free(wal_path);
 
-    var dummy_memtable = MemTable.init(allocator) catch return c.SQLITE_ERROR;
+    var dummy_memtable = MemTable.init(allocator, self.db.io) catch return c.SQLITE_ERROR;
     defer dummy_memtable.deinit();
 
-    var temp_wal = WAL.init(allocator, wal_path, .Off) catch return c.SQLITE_ERROR;
+    var temp_wal = WAL.init(allocator, wal_path, .Off, self.db.io) catch return c.SQLITE_ERROR;
     defer temp_wal.deinit();
 
     _ = temp_wal.replay(dummy_memtable, 0) catch |err| {
@@ -924,8 +934,9 @@ fn axion_alter_add_column_func(context: ?*c.sqlite3_context, argc: c_int, argv: 
 
     var vtab: ?*types.AxionVTab = null;
     {
-        types.vtab_registry_mutex.lock();
-        defer types.vtab_registry_mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        types.vtab_registry_mutex.lockUncancelable(io);
+        defer types.vtab_registry_mutex.unlock(io);
         if (types.vtab_registry) |map| {
             if (types.getVTabRegistryKey(allocator, db.?, table_name)) |key| {
                 defer allocator.free(key);
@@ -1011,13 +1022,14 @@ pub export fn sqlite3_axion_init(db: ?*c.sqlite3, pzErrMsg: [*c][*c]u8, pApi: ?*
 }
 
 fn parseConfigFile(alloc: std.mem.Allocator, path: []const u8, opts: *DB.DBOptions) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
 
-    const size = try file.getEndPos();
+    const size = try file.length(io);
     const content = try alloc.alloc(u8, size);
     errdefer alloc.free(content);
-    _ = try file.read(content);
+    _ = try file.readPositionalAll(io, content, 0);
     defer alloc.free(content);
 
     var line_it = std.mem.tokenizeAny(u8, content, "\n");
@@ -1093,13 +1105,13 @@ fn encodeValueAppend(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8)
 }
 
 fn encodeValue(alloc: std.mem.Allocator, val: ?*c.sqlite3_value, col_type: Schema.ColumnType) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     try encodeValueAppend(alloc, &buf, val, col_type);
     return buf.toOwnedSlice(alloc);
 }
 
 fn encodePrimaryKey(alloc: std.mem.Allocator, val: ?*c.sqlite3_value, col_type: Schema.ColumnType) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     try buf.append(alloc, @intFromEnum(CompositeKey.KeyType.Primary));
     try encodeValueAppend(alloc, &buf, val, col_type);
     return buf.toOwnedSlice(alloc);

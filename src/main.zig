@@ -19,16 +19,15 @@ const HELP_TEXT =
     \\
 ;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const stdout = try std.fs.openFileAbsolute("/dev/stdout", .{ .mode = .write_only });
-    defer stdout.close();
+    const stdout = try std.Io.Dir.openFileAbsolute(io, "/dev/stdout", .{ .mode = .write_only });
+    defer stdout.close(io);
 
-    const stdin = try std.fs.openFileAbsolute("/dev/stdin", .{ .mode = .read_only });
-    defer stdin.close();
+    const stdin = try std.Io.Dir.openFileAbsolute(io, "/dev/stdin", .{ .mode = .read_only });
+    defer stdin.close(io);
 
     var db_instance: ?*DB = null;
     var db_path: ?[]u8 = null;
@@ -39,13 +38,12 @@ pub fn main() !void {
     }
 
     // Argument parsing
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args_iter.skip(); // Skip executable name
 
-    if (args.len > 1) {
-        const path = args[1];
+    if (args_iter.next()) |path| {
         db_path = try allocator.dupe(u8, path);
-        db_instance = DB.open(allocator, path, .{ .wal_sync_mode = .Full }) catch |err| {
+        db_instance = DB.open(allocator, path, .{ .wal_sync_mode = .Full }, io) catch |err| {
             try print(stdout, "Failed to open DB at '{s}': {}\n", .{ path, err });
             return;
         };
@@ -86,7 +84,7 @@ pub fn main() !void {
                 if (db_path) |old_p| allocator.free(old_p);
 
                 db_path = try allocator.dupe(u8, p);
-                db_instance = DB.open(allocator, p, .{ .wal_sync_mode = .Full }) catch |err| {
+                db_instance = DB.open(allocator, p, .{ .wal_sync_mode = .Full }, io) catch |err| {
                     try print(stdout, "Error opening DB: {}\n", .{err});
                     if (db_path) |dp| {
                         allocator.free(dp);
@@ -223,17 +221,25 @@ pub fn main() !void {
     }
 }
 
-fn print(file: std.fs.File, comptime fmt: []const u8, args: anytype) !void {
-    var buf: [4096]u8 = undefined;
-    const slice = try std.fmt.bufPrint(&buf, fmt, args);
-    try file.writeAll(slice);
+fn print(file: std.Io.File, comptime fmt: []const u8, args: anytype) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf_arr: [4096]u8 = undefined;
+    const slice = try std.fmt.bufPrint(&buf_arr, fmt, args);
+    try file.writeStreamingAll(io, slice);
 }
 
-fn readLine(file: std.fs.File, buf: []u8) !?[]const u8 {
+fn readLine(file: std.Io.File, buf: []u8) !?[]const u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
     var pos: usize = 0;
     while (pos < buf.len) {
         var byte: [1]u8 = undefined;
-        const n = try file.read(&byte);
+        const n = file.readStreaming(io, &.{&byte}) catch |err| switch (err) {
+            error.EndOfStream => {
+                if (pos == 0) return null;
+                return buf[0..pos];
+            },
+            else => return err,
+        };
         if (n == 0) {
             if (pos == 0) return null;
             return buf[0..pos];
@@ -249,7 +255,7 @@ fn readLine(file: std.fs.File, buf: []u8) !?[]const u8 {
 
 test "simple test" {
     const gpa = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(i32) = .{};
+    var list: std.ArrayListUnmanaged(i32) = .empty;
     defer list.deinit(gpa);
     try list.append(gpa, 42);
     try std.testing.expectEqual(@as(i32, 42), list.pop());

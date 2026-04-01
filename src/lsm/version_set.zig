@@ -24,8 +24,8 @@ pub const Version = struct {
         self.allocator = allocator;
         self.memtable = mem;
         self.memtable.ref(); // Strong reference
-        self.immutables = .{};
-        for (&self.levels) |*l| l.* = .{};
+        self.immutables = .empty;
+        for (&self.levels) |*l| l.* = .empty;
         self.ref_count = std.atomic.Value(usize).init(1);
         return self;
     }
@@ -234,24 +234,26 @@ pub const Version = struct {
 
 pub const VersionSet = struct {
     allocator: Allocator,
+    io: std.Io,
     current: *Version,
     manifest: Manifest,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     block_cache: *BlockCache,
     db_path: []const u8,
     compaction_cursors: [Manifest.MAX_LEVELS]usize,
 
-    pub fn init(allocator: Allocator, db_path: []const u8, block_cache: *BlockCache, mem: *MemTable) !*VersionSet {
+    pub fn init(allocator: Allocator, io: std.Io, db_path: []const u8, block_cache: *BlockCache, mem: *MemTable) !*VersionSet {
         const self = try allocator.create(VersionSet);
         self.allocator = allocator;
+        self.io = io;
         self.db_path = try allocator.dupe(u8, db_path);
         self.block_cache = block_cache;
-        self.mutex = .{};
+        self.mutex = .init;
         self.compaction_cursors = [_]usize{0} ** Manifest.MAX_LEVELS;
 
         const manifest_path = try std.fs.path.join(allocator, &.{ db_path, "MANIFEST" });
         defer allocator.free(manifest_path);
-        self.manifest = try Manifest.init(allocator, manifest_path);
+        self.manifest = try Manifest.init(allocator, io, manifest_path);
         errdefer self.manifest.deinit();
 
         self.current = try Version.init(allocator, mem);
@@ -265,7 +267,7 @@ pub const VersionSet = struct {
                 // Open reader if available
                 const path = try getTablePath(allocator, db_path, table_meta.id);
                 defer allocator.free(path);
-                reader = SSTable.Reader.open(allocator, path, block_cache) catch null;
+                reader = SSTable.Reader.open(allocator, path, block_cache, self.io) catch null;
 
                 // Create TableInfo (It takes ownership of keys, so we duplicate)
                 // And it takes ownership of Reader reference (if any)
@@ -291,15 +293,15 @@ pub const VersionSet = struct {
     }
 
     pub fn getCurrent(self: *VersionSet) *Version {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.current.ref();
         return self.current;
     }
 
     pub fn logAndApply(self: *VersionSet, edit: VersionEdit) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Create new Version
         const v = try Version.init(self.allocator, edit.new_memtable orelse self.current.memtable);
@@ -375,8 +377,8 @@ pub const VersionEdit = struct {
     allocator: Allocator,
     new_memtable: ?*MemTable = null,
     flushed_memtable: ?*MemTable = null,
-    tables_to_add: std.ArrayListUnmanaged(TableMetadata) = .{},
-    tables_to_delete: std.ArrayListUnmanaged(u64) = .{},
+    tables_to_add: std.ArrayListUnmanaged(TableMetadata) = .empty,
+    tables_to_delete: std.ArrayListUnmanaged(u64) = .empty,
 
     pub fn init(allocator: Allocator) VersionEdit {
         return .{ .allocator = allocator };

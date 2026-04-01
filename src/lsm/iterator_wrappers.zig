@@ -101,7 +101,7 @@ pub const HashMapIteratorWrapper = struct {
         const self = try allocator.create(HashMapIteratorWrapper);
         self.* = .{
             .allocator = allocator,
-            .entries = .{},
+            .entries = .empty,
             .idx = 0,
         };
 

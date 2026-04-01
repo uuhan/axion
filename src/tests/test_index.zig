@@ -5,11 +5,12 @@ const IndexUpdate = @import("../db.zig").IndexUpdate;
 
 test "Secondary Index Integration" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     const test_path = "test_db_idx";
-    std.fs.cwd().deleteTree(test_path) catch {};
-    defer std.fs.cwd().deleteTree(test_path) catch {};
+    std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, test_path) catch {};
 
-    var db = try DB.open(allocator, test_path, .Full);
+    var db = try DB.open(allocator, test_path, .Full, io);
     defer db.close();
 
     const idx_id_name: u32 = 1;

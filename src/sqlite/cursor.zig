@@ -187,7 +187,7 @@ pub fn xFilter(cursor: [*c]c.sqlite3_vtab_cursor, idxNum: c_int, idxStr: [*c]con
         }
         if (index_def == null) return c.SQLITE_ERROR;
 
-        var seek_values = std.ArrayListUnmanaged([]const u8){};
+        var seek_values = std.ArrayListUnmanaged([]const u8).empty;
         defer seek_values.deinit(arena_alloc);
 
         var arg_iter: usize = 0;
@@ -305,12 +305,13 @@ pub fn xRowid(cursor: [*c]c.sqlite3_vtab_cursor, pRowid: [*c]c.sqlite3_int64) ca
 
 fn createIterator(self: *types.AxionCursor, alloc: std.mem.Allocator) !*Iterator {
     const vtab = @as(*types.AxionVTab, @ptrCast(self.base.pVtab));
-    types.registry_init_once.call();
+    types.ensureRegistryInit();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     const key = types.RegistryKey{ .conn = vtab.sqlite_conn, .db = vtab.db };
     const shard = types.registry.getShard(key);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
+    shard.mutex.lockUncancelable(io);
+    defer shard.mutex.unlock(io);
 
     if (shard.map.getPtr(key)) |entry| {
         if (entry.rolled_back) return error.TransactionRolledBack;
@@ -454,13 +455,13 @@ fn advanceIndexIterator(self: *types.AxionCursor, idx_id: u32) !void {
 }
 
 fn encodeValue(alloc: std.mem.Allocator, val: ?*c.sqlite3_value, col_type: Schema.ColumnType) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     try encodeValueAppend(alloc, &buf, val, col_type);
     return buf.toOwnedSlice(alloc);
 }
 
 fn encodePrimaryKey(alloc: std.mem.Allocator, val: ?*c.sqlite3_value, col_type: Schema.ColumnType) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     try buf.append(alloc, @intFromEnum(CompositeKey.KeyType.Primary));
     try encodeValueAppend(alloc, &buf, val, col_type);
     return buf.toOwnedSlice(alloc);

@@ -95,11 +95,12 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Conf
         config.key_count,
     });
 
-    std.fs.cwd().deleteTree(db_path) catch {};
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
 
     // Pre-populate using fast mode (Off) to avoid waiting forever on Full sync setup
     if (workload == .Read or workload == .Mix or workload == .RangeScan) {
-        var db_prep = DB.open(allocator, db_path, .{ .wal_sync_mode = .Off }) catch return;
+        var db_prep = DB.open(allocator, db_path, .{ .wal_sync_mode = .Off }, io) catch return;
 
         var txn = try db_prep.beginTransaction();
         var i: usize = 0;
@@ -121,7 +122,7 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Conf
         db_prep.close();
     }
 
-    var db = DB.open(allocator, db_path, .{ .wal_sync_mode = mode, .compaction_threads = config.compaction_threads }) catch return;
+    var db = DB.open(allocator, db_path, .{ .wal_sync_mode = mode, .compaction_threads = config.compaction_threads }, io) catch return;
 
     ops_count.store(0, .monotonic);
     should_stop.store(false, .monotonic);
@@ -145,7 +146,7 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Conf
     }.run, .{ config.duration, current_run_id });
     watchdog.detach();
 
-    var threads = std.ArrayListUnmanaged(std.Thread){};
+    var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
     defer threads.deinit(allocator);
 
     var i: usize = 0;
@@ -167,14 +168,14 @@ fn runBenchmark(allocator: std.mem.Allocator, mode: WAL.SyncMode, workload: Conf
     std.debug.print("  Result: {d} ops/sec\n", .{qps});
 
     db.close();
-    std.fs.cwd().deleteTree(db_path) catch {};
+    std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = std.heap.c_allocator;
     std.debug.print("Running Native Axion Benchmarks\n", .{});
 
-    const config = try Config.BenchmarkConfig.parseArgs(allocator);
+    const config = try Config.BenchmarkConfig.parseArgs(init.args);
 
     const modes = [_]WAL.SyncMode{ .Full, .Normal, .Off };
     const workloads = [_]Config.Workload{ .Write, .SeqWrite, .Read, .RangeScan, .Mix };

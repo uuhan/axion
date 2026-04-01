@@ -9,7 +9,8 @@ pub fn main() !void {
     const db_path = "verify_scan_db";
 
     std.debug.print("Setting up DB at {s}...\n", .{db_path});
-    std.fs.cwd().deleteTree(db_path) catch {};
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().deleteTree(io, db_path) catch {};
 
     // Populate using VTab (Composite Keys)
     {
@@ -73,7 +74,7 @@ pub fn main() !void {
     // Verify Native Scan (Raw)
     std.debug.print("\n--- Verifying Native Scan (Raw) ---\n", .{});
     {
-        var db = try DB.open(allocator, db_path, .{ .wal_sync_mode = .Off });
+        var db = try DB.open(allocator, db_path, .{ .wal_sync_mode = .Off }, io);
         defer db.close();
 
         const rot = db.tm.beginReadOnly();

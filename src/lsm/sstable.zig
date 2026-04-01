@@ -15,18 +15,17 @@ test "SSTable basic flow" {
     const BlockCache = @import("block_cache.zig").BlockCache;
 
     const allocator = std.testing.allocator;
-    var rnd = std.crypto.random;
-    var buf: [64]u8 = undefined;
-    const test_path = try std.fmt.bufPrint(&buf, "test_{x}.sst", .{rnd.int(u64)});
+    const io = std.testing.io;
+    const test_path = "test_sstable_basic.sst";
 
-    std.fs.cwd().deleteFile(test_path) catch {};
-    defer std.fs.cwd().deleteFile(test_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
 
-    var block_cache = BlockCache.init(allocator, 1024 * 1024);
+    var block_cache = BlockCache.init(allocator, io, 1024 * 1024);
     defer block_cache.deinit();
 
     // Build
-    var builder = try SSTable.Builder.init(allocator, test_path, true, 3, 64 * 1024);
+    var builder = try SSTable.Builder.init(allocator, test_path, true, 3, 64 * 1024, io);
     try builder.add("key1", "value1", 10);
     try builder.add("key2", "value2", 20);
     try builder.add("key3", "value3", 30);
@@ -34,7 +33,7 @@ test "SSTable basic flow" {
     builder.deinit();
 
     // Read
-    var reader = try SSTable.Reader.open(allocator, test_path, &block_cache);
+    var reader = try SSTable.Reader.open(allocator, test_path, &block_cache, io);
     defer reader.unref();
 
     if (try reader.get(allocator, "key1", 15)) |val| {

@@ -14,7 +14,7 @@ pub const KeyType = enum(u8) {
 /// - values: The values being indexed (e.g., ["Alice", "Smith"]).
 /// - pk: The primary key of the record (e.g., "user:1"), used for uniqueness.
 pub fn encodeIndexKey(allocator: std.mem.Allocator, index_id: u32, values: []const []const u8, pk: []const u8) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     // 1. Type Prefix
@@ -40,7 +40,7 @@ pub fn encodeIndexKey(allocator: std.mem.Allocator, index_id: u32, values: []con
 /// Format: [KeyType: 1B] [IndexID: 4B] [Value1][Term]...
 /// Used to check for existence of a value in a UNIQUE index or range scan.
 pub fn encodeIndexSeekKey(allocator: std.mem.Allocator, index_id: u32, values: []const []const u8) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     // 1. Type Prefix
@@ -111,7 +111,7 @@ pub fn extractPrimaryKey(allocator: std.mem.Allocator, index_key: []const u8, nu
 }
 
 fn decodeBytes(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     var i: usize = 0;
