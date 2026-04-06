@@ -304,6 +304,12 @@ pub const Reader = struct {
                     } else if (res.buffer) |b| {
                         val_ref.owned_buffer = b;
                         keep_buffer = true;
+                    } else if (res.mmap_slice != null) {
+                        // mmap data is not ref-counted; duplicate to ensure
+                        // the ValueRef remains valid after Reader is unrefed.
+                        const dup = try self.allocator.dupe(u8, entry.value);
+                        val_ref.data = dup;
+                        val_ref.owned_buffer = dup;
                     }
                     return val_ref;
                 }

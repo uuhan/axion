@@ -87,7 +87,7 @@ pub const Compaction = struct {
         max_version: u64,
     };
 
-    pub fn compact(allocator: Allocator, inputs: []const []const u8, dir_path: []const u8, gc_threshold: u64, target_file_size: u64, id_gen_ctx: *anyopaque, id_gen_fn: *const fn (ctx: *anyopaque) u64, io: std.Io) !std.ArrayListUnmanaged(CompactResult) {
+    pub fn compact(allocator: Allocator, inputs: []const []const u8, dir_path: []const u8, gc_threshold: u64, target_file_size: u64, id_gen_ctx: *anyopaque, id_gen_fn: *const fn (ctx: *anyopaque) u64, io: std.Io, is_bottommost: bool) !std.ArrayListUnmanaged(CompactResult) {
         const readers = try allocator.alloc(*SSTable.Reader, inputs.len);
         var readers_init_count: usize = 0;
 
@@ -100,9 +100,11 @@ pub const Compaction = struct {
         }
 
         const wrappers = try allocator.alloc(SSTableIteratorWrapper, inputs.len);
+        var wrappers_init_count: usize = 0;
         defer {
-            for (wrappers) |*w| {
-                w.iter.deinit();
+            var j: usize = 0;
+            while (j < wrappers_init_count) : (j += 1) {
+                wrappers[j].iter.deinit();
             }
             allocator.free(wrappers);
         }
@@ -115,6 +117,7 @@ pub const Compaction = struct {
             readers_init_count += 1;
 
             wrappers[i] = SSTableIteratorWrapper.init(readers[i].iterator());
+            wrappers_init_count += 1;
             iterators[i] = wrappers[i].iterator();
         }
 
@@ -158,7 +161,10 @@ pub const Compaction = struct {
                 keep = true;
             } else {
                 if (!found_snapshot_version) {
-                    if (entry.value.len > 0) {
+                    // Keep the first version at or below gc_threshold.
+                    // Only drop tombstones (empty values) at the bottommost level,
+                    // otherwise they must be propagated to shadow older values in deeper levels.
+                    if (entry.value.len > 0 or !is_bottommost) {
                         keep = true;
                     }
                     found_snapshot_version = true;
@@ -438,7 +444,7 @@ test "Compaction basic flow" {
 
     const inputs = [_][]const u8{ path1, path2 };
     var id_gen = MockIdGen{};
-    var results = try Compaction.compact(allocator, &inputs, dir, 15, 1024 * 1024, &id_gen, MockIdGen.gen, io);
+    var results = try Compaction.compact(allocator, &inputs, dir, 15, 1024 * 1024, &id_gen, MockIdGen.gen, io, true);
     defer {
         for (results.items) |r| {
             allocator.free(r.min_key);

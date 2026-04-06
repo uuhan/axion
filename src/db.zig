@@ -572,7 +572,9 @@ pub const DB = struct {
 
         const target_size = 64 * 1024 * 1024;
 
-        var results = try Compaction.compact(self.allocator, inputs.items, self.db_path, self.tm.getMinActiveVersion(), target_size, self, dbIdGen, self.io);
+        const Manifest = @import("lsm/manifest.zig").Manifest;
+        const is_bottommost = (task.level + 1 == Manifest.MAX_LEVELS - 1);
+        var results = try Compaction.compact(self.allocator, inputs.items, self.db_path, self.tm.getMinActiveVersion(), target_size, self, dbIdGen, self.io, is_bottommost);
 
         defer {
             for (results.items) |*r| {
