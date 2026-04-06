@@ -87,7 +87,7 @@ pub const Reader = struct {
 
     fn deinit(self: *Reader) void {
         if (self.mmap_ptr) |ptr| {
-            std.posix.munmap(ptr);
+            std.posix.munmap(@alignCast(ptr));
         }
         self.file.close(self.io);
         for (self.index.items) |entry| {

@@ -984,7 +984,7 @@ fn axion_alter_add_column_func(context: ?*c.sqlite3_context, argc: c_int, argv: 
         return;
     };
 
-    c.sqlite3_result_text(context, "Column Added. Please reconnect.", -1, c.SQLITE_TRANSIENT);
+    c.sqlite3_result_text(context, "Column Added. Please reconnect.", -1, c.SQLITE_STATIC);
 }
 
 const AxionScalarFunc = fn (?*c.sqlite3_context, c_int, [*c]?*c.sqlite3_value) callconv(.c) void;
